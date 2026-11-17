@@ -5,6 +5,8 @@
 - A pattern can set the tempo: `cps("<0.5 1>")` changes it at each onset, unless Link or MIDI clock leads.
 - The theme picker shows its Ctrl+N new, Ctrl+E edit and Ctrl+D delete keys.
 - Fixed: the theme editor opened from the theme picker shows on top of the reference.
+- A score made of patterns, controls, functions, arrows and lanes is evaluated without JavaScript, 15 to 60 times faster on a new session, and an edit builds only the calls it changed. The script engine starts only for a score that needs it: the memory breakdown and `rustel play` name the line that needs it.
+- A score evaluated again keeps the answers of what it did not change, and a restarted section is asked only where it plays: the first query after an edit of a large score runs up to 170 times faster, and the first query of a score in sections about 17 times faster.
 
 ## v0.1.7
 
