@@ -746,8 +746,9 @@ impl LiveFileProducer {
     /// A preparation error rejects the replacement and preserves the audible score.
     /// `install` ships the plugin inserts of an accepted window to the output
     /// before its generation or events publish. A refused window installs
-    /// nothing. `install` gets only the events the backlog keeps, and must not
-    /// wait for loading or build assets.
+    /// nothing. `install` gets the window the ring will be offered, which a
+    /// full pipeline may still drop the newest events of, and must not wait
+    /// for loading or build assets.
     #[allow(
         clippy::too_many_arguments,
         reason = "preparation, insert installation, generation publication and ring delivery are separate ordered hooks"
@@ -1554,8 +1555,9 @@ impl LiveFileProducer {
     /// Prepare a shield window once before any event crosses the ring. A
     /// backpressured window keeps its reservation until it drains or is replaced.
     /// `install` ships the plugin inserts of the window to the output before its
-    /// events publish. It gets only the events the backlog keeps, and must not
-    /// wait for loading or build assets.
+    /// events publish. It gets the window the ring will be offered, which a
+    /// full pipeline may still drop the newest events of, and must not wait
+    /// for loading or build assets.
     pub fn shield_reload_with_clock_and_preparation(
         &mut self,
         session: &mut Session,
@@ -1793,7 +1795,8 @@ impl LiveFileProducer {
     /// A preparation error rejects the replacement and preserves the audible score.
     /// `install` ships the plugin inserts of an accepted window to the output
     /// before its cutover and events. A refused window installs nothing.
-    /// `install` gets only the events the backlog keeps, and must not wait for
+    /// `install` gets the window the ring will be offered, which a full
+    /// pipeline may still drop the newest events of, and must not wait for
     /// loading or build assets.
     #[allow(
         clippy::too_many_arguments,
@@ -2693,6 +2696,10 @@ impl LiveFileProducer {
                 None
             };
             let room = if confirmation.is_some() {
+                // The receipted branch below relies on the arm paths clearing
+                // the backlog first, so every offered onset fits and no
+                // ordinal is orphaned. Pin that dependency here.
+                debug_assert!(self.pending.is_empty());
                 MAX_PENDING_BACKLOG.saturating_sub(self.pending.len())
             } else {
                 usize::MAX
@@ -2866,6 +2873,9 @@ impl LiveFileProducer {
         let dropped = self.pending.len().saturating_sub(MAX_PENDING_BACKLOG);
         if dropped > 0 {
             self.pending.truncate(MAX_PENDING_BACKLOG);
+            // One oversized window grows the deque past the cap; without a
+            // shrink the producer keeps that capacity for its lifetime.
+            self.pending.shrink_to_fit();
         }
         self.report_backlog_drop(session, dropped);
     }
