@@ -706,6 +706,9 @@ impl App {
         if self.smart_action_event(&terminal_event) {
             return Ok(());
         }
+        if self.pod_prompt_event(&terminal_event) {
+            return Ok(());
+        }
         if self.precision_slider_event(&terminal_event) {
             return Ok(());
         }
@@ -1203,6 +1206,13 @@ impl App {
         }
         if primary && shift && letter == Some('x') && !self.key_is_a_learnt_chord(key) {
             self.toggle_export_sheet();
+            return true;
+        }
+        // The pod prompt: J beside ^J's quick action, where the terminal
+        // tells ^⇧J from ^J. Opening it replaces whatever dialog is up,
+        // the way the export sheet does.
+        if primary && shift && letter == Some('j') && !self.key_is_a_learnt_chord(key) {
+            self.open_pod_prompt(super::pod::PodPromptKind::Request);
             return true;
         }
         if primary && shift && letter == Some('o') && !self.key_is_a_learnt_chord(key) {

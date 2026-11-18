@@ -287,6 +287,7 @@ impl App {
         self.poll_reveal();
         self.poll_sample_details();
         self.poll_vim_config(now);
+        self.pump_pod();
         self.poll_external_changes(now);
         if let Err(error) = super::vim::flush_timeout(self) {
             self.set_error(ErrorOwner::Editor, error.to_string());

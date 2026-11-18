@@ -80,6 +80,11 @@ pub struct StudioPrefs {
     /// or `sync-eval`. Absent is off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_changes: Option<String>,
+    /// The pod command template, with `{prompt}`, `{set}` and `{file}`
+    /// placeholders. Absent or empty hides the pod prompt: the feature is
+    /// opted into by configuring a command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pod_command: Option<String>,
     /// Whether an update renames the score's file to its `@title` field.
     /// Absent is off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -822,6 +827,7 @@ impl StudioPrefs {
                 .as_deref()
                 .map(super::settings::ExternalChanges::parse)
                 .unwrap_or(defaults.external_changes),
+            pod_command: self.pod_command.clone().unwrap_or_default(),
             sync_name_from_title: self
                 .sync_name_from_title
                 .unwrap_or(defaults.sync_name_from_title),
@@ -1028,6 +1034,7 @@ impl StudioPrefs {
         self.auto_evaluate = Some(settings.auto_evaluate);
         self.typing_pause = Some(settings.typing_pause.key().to_owned());
         self.external_changes = Some(settings.external_changes.key().to_owned());
+        self.pod_command = Some(settings.pod_command.clone());
         self.sync_name_from_title = Some(settings.sync_name_from_title);
         self.load_mode = Some(settings.load_mode.key().to_owned());
         self.animation = Some(settings.animation);

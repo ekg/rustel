@@ -102,6 +102,8 @@ pub enum BindAction {
     ToggleComment,
     /// Find text in the focused score.
     Find,
+    /// Open the pod prompt: hand a prompt to the configured pod command.
+    PodPrompt,
     FirstError,
     // Scenes
     NewScene,
@@ -137,7 +139,7 @@ pub enum BindAction {
 
 impl BindAction {
     /// Every action, in the order the Keybinds page lists them.
-    pub const ALL: [BindAction; 59] = [
+    pub const ALL: [BindAction; 60] = [
         // Transport
         Self::Evaluate,
         Self::Stop,
@@ -177,6 +179,7 @@ impl BindAction {
         Self::SelectAll,
         Self::ToggleComment,
         Self::Find,
+        Self::PodPrompt,
         Self::FirstError,
         // Scenes
         Self::NewScene,
@@ -245,6 +248,7 @@ impl BindAction {
             Self::SelectAll => "select-all",
             Self::ToggleComment => "comment",
             Self::Find => "find",
+            Self::PodPrompt => "pod-prompt",
             Self::FirstError => "first-error",
             Self::NewScene => "new-scene",
             Self::DuplicateScene => "duplicate-scene",
@@ -317,6 +321,7 @@ impl BindAction {
             Self::SelectAll => "select all",
             Self::ToggleComment => "comment or uncomment",
             Self::Find => "find text",
+            Self::PodPrompt => "pod prompt",
             Self::FirstError => "first error / locate cursor",
             Self::NewScene => "new scene",
             Self::DuplicateScene => "duplicate scene",
@@ -418,6 +423,12 @@ impl BindAction {
             // Ctrl+Shift+F is the familiar find chord, but nearly every
             // terminal keeps it. Y is free on all shipped profiles but Hyper.
             Self::Find => ctrl_shift(Char('y')),
+            // The pod prompt sits beside ^J's quick action on J, the next
+            // letter no shipped default holds after Y. Four profiles keep
+            // ^⇧J for themselves (kitty, GNOME and VTE, and Ghostty); there
+            // the reach table moves the action onto a portable F-key the
+            // same way find moves off Y on Hyper.
+            Self::PodPrompt => ctrl_shift(Char('j')),
             Self::FirstError => shift(F(3)),
             Self::NewScene => ctrl(Char('n')),
             Self::DuplicateScene => plain(F(3)),

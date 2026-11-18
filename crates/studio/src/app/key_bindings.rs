@@ -275,6 +275,10 @@ impl App {
                 self.open_find();
                 Ok(true)
             }
+            Do::PodPrompt => {
+                self.open_pod_prompt(pod::PodPromptKind::Request);
+                Ok(true)
+            }
             Do::RecordTake => {
                 self.toggle_take();
                 Ok(true)

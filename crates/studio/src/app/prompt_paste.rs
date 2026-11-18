@@ -33,6 +33,11 @@ impl App {
         if self.piano.open || self.help.is_some() || self.menu.is_some() {
             return false;
         }
+        // A prompt that holds the keyboard takes a paste whole, the way
+        // the quick action's form does.
+        if self.pod_prompt.is_some() {
+            return true;
+        }
         // Coalesce a Ctrl+V flood wherever a panel might otherwise type
         // it as `n`/`a`/`Enter`. The paste is then kept or ignored; it
         // is never executed as shortcuts.
