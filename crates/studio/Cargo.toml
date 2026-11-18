@@ -20,7 +20,9 @@ hydra = ["dep:rustel-hydra", "rustel-runtime/hydra", "rustel-studio-themes/hydra
 themes = ["rustel-studio-themes/pack"]
 # The picture half of a video sample: the painters, the dock's video
 # widget, and the detached desktop window it opens. `winit` and
-# `softbuffer` are the window itself, pure Rust, no GPU stack.
+# `softbuffer` are the window itself, pure Rust, no GPU stack; Android has
+# no desktop for a detached window, so there the window is declined and
+# the widget keeps its clip (see `app/video_window.rs`).
 video = ["rustel-runtime/video", "dep:winit", "dep:softbuffer"]
 osc = ["dep:rustel-osc", "rustel-runtime/osc"]
 serial = ["dep:rustel-serial", "rustel-runtime/serial"]
@@ -64,13 +66,6 @@ serde_json = { version = "1", features = ["preserve_order"] }
 tempfile = "3"
 getrandom = { version = "0.4", optional = true }
 url = "2.5.8"
-# The detached video window's surface: winit opens the desktop window and
-# softbuffer presents the frame, both pure Rust and neither a GPU stack.
-winit = { version = "0.30", optional = true }
-softbuffer = { version = "0.4", optional = true }
-# The terminal studio is intentionally a Rust-only surface. Ratatui shares the
-# exact Crossterm 0.29 event types used for enhanced-keyboard negotiation.
-arboard = { version = "3.6", default-features = false }
 crossterm = "0.29"
 # zlib for the kitty graphics protocol: a frame of pixels is a few hundred
 # kilobytes raw and a few tens compressed, forty times a second.
@@ -85,6 +80,19 @@ ropey = "1.6"
 regex = "1"
 unicode-segmentation = "1.12"
 unicode-width = "0.2"
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+# The system clipboard: arboard 3 has no Android platform module, so
+# Android builds use the process-local fallback only (see
+# `editor/clipboard.rs`).
+arboard = { version = "3.6", default-features = false }
+# The detached video window's surface: winit opens the desktop window and
+# softbuffer presents the frame, both pure Rust and neither a GPU stack.
+# winit on Android wants an `android_main` entrypoint inside a JVM-bearing
+# app, which a terminal process has none of, so the window is built out
+# there (see `app/video_window.rs`).
+winit = { version = "0.30", optional = true }
+softbuffer = { version = "0.4", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 # Terminal polling and size, and standard error pointed at the studio log.

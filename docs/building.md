@@ -139,8 +139,14 @@ live path. `device-audio` without `midi` does not build the command on any
 platform: the live command's Link timing reads the runtime's `midi_clock`
 module, which the `midi` feature gates.
 
-The studio does not cross-compile: `arboard`, its clipboard dependency,
-has no Android backend.
+The studio cross-compiles with the same recipe and its full default
+feature set. `arboard` has no Android platform module and winit wants
+an `android_main` entrypoint inside a JVM-bearing app there, so both are
+target-gated off on Android: the studio's clipboard keeps only its
+process-local fallback (a copy stays useful inside the studio, a paste of
+nothing copied there reports the empty clipboard), and the detached video
+window is declined - the clip keeps playing in the dock's video widget,
+with the reason in the status line.
 
 Runtime behavior on Android, as far as the code shows (validated to the
 link; no Android device was attached at the time of writing):

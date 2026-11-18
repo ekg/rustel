@@ -9,29 +9,46 @@
 //! floats above the others, so the picture stays in sight while the
 //! terminal keeps the keys. Closing a window, or Enter on the widget
 //! again, folds the picture back into the dock.
+//!
+//! Android has no desktop to open a window on: winit there wants an
+//! `android_main` entrypoint inside a JVM-bearing app, which a terminal
+//! process has none of. The desktop half is built out, and every window
+//! the studio asks for ends immediately, so the clip stays in the dock.
 
+#[cfg(not(target_os = "android"))]
 use std::cell::RefCell;
+#[cfg(not(target_os = "android"))]
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+#[cfg(not(target_os = "android"))]
 use std::time::Duration;
 
 use rustel_runtime::video::VideoThumbnails;
+#[cfg(not(target_os = "android"))]
 use winit::application::ApplicationHandler;
+#[cfg(not(target_os = "android"))]
 use winit::event::WindowEvent;
+#[cfg(not(target_os = "android"))]
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
+#[cfg(not(target_os = "android"))]
 use winit::platform::pump_events::EventLoopExtPumpEvents as _;
+#[cfg(not(target_os = "android"))]
 use winit::window::{Window, WindowId, WindowLevel};
 
 use super::App;
 
-/// What a window draws: one clip, at one position inside it.
+/// What a window draws: one clip, at one position inside it. Only the
+/// desktop loop reads one; an Android build has no loop to give it to.
+#[cfg_attr(target_os = "android", allow(dead_code))]
 struct WindowFrame {
     strip: Arc<VideoThumbnails>,
     position: f32,
 }
 
-/// Why a window the studio asked for is gone.
+/// Why a window the studio asked for is gone. `Closed` needs a desktop
+/// close button, which Android has none of.
+#[cfg_attr(target_os = "android", allow(dead_code))]
 #[derive(Clone, Debug, PartialEq)]
 enum Ending {
     /// Its close button was used.
@@ -40,7 +57,9 @@ enum Ending {
     Failed(String),
 }
 
-/// One window the studio asked for, as both threads see it.
+/// One window the studio asked for, as both threads see it. Only the
+/// desktop loop reads the feed and the newest frame back.
+#[cfg_attr(target_os = "android", allow(dead_code))]
 struct Wanted {
     id: u64,
     feed: String,
@@ -59,7 +78,10 @@ fn wanted() -> MutexGuard<'static, Vec<Wanted>> {
     WANTED.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Mark one wanted window gone, unless it already is.
+/// Mark one wanted window gone, unless it already is. Only the desktop
+/// loop's close event calls this; Android windows end in `pump` instead,
+/// which already holds the wanted list `end` would lock again.
+#[cfg_attr(target_os = "android", allow(dead_code))]
 fn end(id: u64, ending: Ending) {
     if let Some(window) = wanted().iter_mut().find(|window| window.id == id) {
         window.ending.get_or_insert(ending);
@@ -146,9 +168,11 @@ thread_local! {
     /// The loop and its windows, on the one thread that owns them. Made
     /// with the first window and then kept, because winit refuses a
     /// second loop.
+    #[cfg(not(target_os = "android"))]
     static DESKTOP: RefCell<Option<Result<Desktop, String>>> = const { RefCell::new(None) };
 }
 
+#[cfg(not(target_os = "android"))]
 fn pump() {
     DESKTOP.with_borrow_mut(|desktop| {
         if desktop.is_none() {
@@ -171,7 +195,19 @@ fn pump() {
     });
 }
 
+/// Every window asked for ends immediately, so `pump_video_window` folds
+/// its clip back into the dock with the reason in the status line.
+#[cfg(target_os = "android")]
+fn pump() {
+    for window in wanted().iter_mut() {
+        window
+            .ending
+            .get_or_insert(Ending::Failed("Android has no desktop window".to_owned()));
+    }
+}
+
 /// The event loop and the windows it shows.
+#[cfg(not(target_os = "android"))]
 struct Desktop {
     event_loop: EventLoop<()>,
     /// Wakes the loop with an event of its own, for a window to make.
@@ -179,6 +215,7 @@ struct Desktop {
     windows: Windows,
 }
 
+#[cfg(not(target_os = "android"))]
 impl Desktop {
     fn open() -> Result<Self, String> {
         let mut builder = EventLoop::builder();
@@ -242,11 +279,13 @@ impl Desktop {
 }
 
 /// The open windows; the target of the pumped events.
+#[cfg(not(target_os = "android"))]
 #[derive(Default)]
 struct Windows {
     shown: Vec<Shown>,
 }
 
+#[cfg(not(target_os = "android"))]
 impl Windows {
     /// Drop the windows the studio let go.
     fn let_go(&mut self) {
@@ -281,6 +320,7 @@ impl Windows {
     }
 }
 
+#[cfg(not(target_os = "android"))]
 impl ApplicationHandler<()> for Windows {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         self.follow(event_loop);
@@ -313,6 +353,7 @@ impl ApplicationHandler<()> for Windows {
 }
 
 /// One window on the desktop, with the surface it presents.
+#[cfg(not(target_os = "android"))]
 struct Shown {
     id: u64,
     window: Arc<Window>,
@@ -323,6 +364,7 @@ struct Shown {
     size: (usize, usize),
 }
 
+#[cfg(not(target_os = "android"))]
 impl Shown {
     fn open(event_loop: &ActiveEventLoop, id: u64, feed: &str) -> Result<Self, String> {
         let attributes = Window::default_attributes()

@@ -53,7 +53,11 @@ impl Clipboard for MemoryClipboard {
 ///
 /// The arboard handle deliberately lives for the whole UI session: on Linux
 /// the process that owns clipboard text may need to remain alive to serve it.
+/// Android has no arboard backend, so there the fallback is the whole
+/// clipboard: copies stay within the process and a paste of nothing copied
+/// here reports that the clipboard contains no text.
 pub struct PlatformClipboard {
+    #[cfg(not(target_os = "android"))]
     system: Option<arboard::Clipboard>,
     fallback: MemoryClipboard,
 }
@@ -62,7 +66,7 @@ impl fmt::Debug for PlatformClipboard {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("PlatformClipboard")
-            .field("system_available", &self.system.is_some())
+            .field("system_available", &self.system_available())
             .field("fallback", &self.fallback)
             .finish()
     }
@@ -77,16 +81,25 @@ impl Default for PlatformClipboard {
 impl PlatformClipboard {
     pub fn new() -> Self {
         Self {
+            #[cfg(not(target_os = "android"))]
             system: arboard::Clipboard::new().ok(),
             fallback: MemoryClipboard::default(),
         }
     }
 
     pub fn system_available(&self) -> bool {
-        self.system.is_some()
+        #[cfg(not(target_os = "android"))]
+        {
+            self.system.is_some()
+        }
+        #[cfg(target_os = "android")]
+        {
+            false
+        }
     }
 }
 
+#[cfg(not(target_os = "android"))]
 impl Clipboard for PlatformClipboard {
     fn get_text(&mut self) -> Result<String, ClipboardError> {
         if let Some(system) = &mut self.system {
@@ -162,6 +175,20 @@ impl Clipboard for PlatformClipboard {
             }
         }
         Ok(())
+    }
+}
+
+/// Android has no arboard backend, so both directions are the process-local
+/// fallback: a copy stays useful within the studio and a paste of nothing
+/// copied here reports the empty clipboard.
+#[cfg(target_os = "android")]
+impl Clipboard for PlatformClipboard {
+    fn get_text(&mut self) -> Result<String, ClipboardError> {
+        self.fallback.get_text()
+    }
+
+    fn set_text(&mut self, text: String) -> Result<(), ClipboardError> {
+        self.fallback.set_text(text)
     }
 }
 
