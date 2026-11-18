@@ -420,6 +420,8 @@ prompt, and press Enter. Studio runs the command in the background with the
 set folder as its working directory; what the pod writes, the
 [external changes](#external-changes) watch follows - `sync` takes the saved
 text into the editor, and `sync & eval` opens the score's tab and plays it.
+That watch is off by default, so turn it on there too: until it is on, the
+pod's writes land in the files and Studio does not follow them.
 
 The template is split on whitespace into the command's arguments; there is no
 shell, so nothing in it is quoted, escaped or expanded by anything else. Three
@@ -430,6 +432,9 @@ placeholders are replaced first:
 | `{prompt}` | the prompt you typed |
 | `{set}` | the set folder the pod runs in |
 | `{file}` | the open score's path |
+
+A template that names `{file}` refuses to run while no score is open - a tape
+or a replay has no file to hand the pod.
 
 A template with no `{prompt}` gets the prompt appended as its final argument,
 so a bare program name is a complete configuration. For example:

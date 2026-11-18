@@ -30,6 +30,7 @@ use ratatui::style::Style;
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use std::path::Path;
 use std::process::{Child, Stdio};
+use unicode_width::UnicodeWidthChar;
 
 /// The most lines of one pod's output the studio keeps, and the most
 /// bytes. Both keep the tail: a pod that talks all night costs the log
@@ -45,6 +46,14 @@ const CAPTURE_LINE_MAX: usize = 4096;
 /// How many lines one turn takes from the running pod. The capture
 /// cannot retain more than [`CAPTURE_MAX_LINES`] of them anyway.
 const LINES_PER_TURN: usize = CAPTURE_MAX_LINES;
+
+/// How many read lines may wait for the turn loop between the readers
+/// and the studio. A pod that streams faster than the loop drains fills
+/// this, and the reader blocks on it - which backpressures the pod
+/// through its own output pipe, the way any full pipe does - instead of
+/// growing the studio's memory until the pod exits. The loop drains on
+/// every turn while a pod runs, so the queue always empties.
+const READ_QUEUE: usize = 256;
 
 /// The most a prompt holds. A prompt is a sentence or two for the pod;
 /// a book is a score, and belongs in the file the pod rewrites.
@@ -82,14 +91,41 @@ impl PodPrompt {
         }
     }
 
-    /// The text the prompt's one row shows, and the caret's column in
-    /// it: the tail that holds the caret, the way a terminal line reads.
+    /// The text the prompt's one row shows, and the caret's column in it:
+    /// the tail that holds the caret, the way a terminal line reads.
+    /// Both are laid out in display cells rather than characters, so a
+    /// wide character still fits the row and the caret column is where
+    /// the terminal draws it; a wide character with no room left is left
+    /// out rather than half-drawn.
     fn window(&self, width: usize) -> (String, u16) {
         let width = width.max(1);
+        let characters: Vec<char> = self.text.chars().collect();
         let caret = self.text[..self.cursor].chars().count();
-        let start = caret.saturating_sub(width - 1);
-        let shown: String = self.text.chars().skip(start).take(width).collect();
-        (shown, (caret - start) as u16)
+        // Walk back from the caret, keeping whole characters whose cells
+        // still fit beside it.
+        let mut first = caret;
+        let mut before = 0;
+        while first > 0 {
+            let cells = characters[first - 1].width().unwrap_or(0);
+            if before + cells > width - 1 {
+                break;
+            }
+            before += cells;
+            first -= 1;
+        }
+        // Walk forward with the rest of the room.
+        let mut last = caret;
+        let mut after = 0;
+        while last < characters.len() {
+            let cells = characters[last].width().unwrap_or(0);
+            if before + after + cells > width {
+                break;
+            }
+            after += cells;
+            last += 1;
+        }
+        let shown: String = characters[first..last].iter().collect();
+        (shown, before as u16)
     }
 
     fn insert(&mut self, text: &str) {
@@ -117,7 +153,10 @@ impl PodPrompt {
 ///
 /// `{prompt}` is what the prompt held, `{set}` the set folder the pod
 /// runs in, and `{file}` the active score's path. Each placeholder stays
-/// one argument however many spaces its value holds. A template with no
+/// one argument however many spaces its value holds, and the prompt's
+/// own words are never re-expanded: `{set}` and `{file}` are replaced
+/// first and `{prompt}` last, so a prompt that quotes a placeholder
+/// reaches the pod as the words the player typed. A template with no
 /// `{prompt}` gets the prompt appended as its final argument, so a bare
 /// program name is a complete configuration.
 pub(super) fn pod_arguments(
@@ -135,9 +174,9 @@ pub(super) fn pod_arguments(
         .split_whitespace()
         .map(|argument| {
             argument
-                .replace("{prompt}", prompt)
                 .replace("{set}", &set.display().to_string())
                 .replace("{file}", file.as_deref().unwrap_or_default())
+                .replace("{prompt}", prompt)
         })
         .collect();
     if !template.contains("{prompt}") {
@@ -231,7 +270,7 @@ pub(super) fn render_prompt(frame: &mut ratatui::Frame<'_>, theme: &Theme, promp
 /// completes. A line longer than [`CAPTURE_LINE_MAX`] is sent as its head
 /// with an ellipsis; the rest of it is read away rather than kept, so no
 /// pod can cost the studio the memory of one enormous answer.
-fn forward_stream<R: std::io::Read>(mut reader: R, sender: std::sync::mpsc::Sender<String>) {
+fn forward_stream<R: std::io::Read>(mut reader: R, sender: std::sync::mpsc::SyncSender<String>) {
     let mut pending: Vec<u8> = Vec::new();
     // The tail of a line whose head was already sent: read away, unsent.
     let mut discarding = false;
@@ -244,7 +283,7 @@ fn forward_stream<R: std::io::Read>(mut reader: R, sender: std::sync::mpsc::Send
                 discarding = false;
                 continue;
             }
-            if at >= CAPTURE_LINE_MAX {
+            if at > CAPTURE_LINE_MAX {
                 let head: Vec<u8> = pending.drain(..CAPTURE_LINE_MAX).collect();
                 if send_line(&sender, head, true).is_err() {
                     return;
@@ -260,8 +299,10 @@ fn forward_stream<R: std::io::Read>(mut reader: R, sender: std::sync::mpsc::Send
         }
         // Still no newline: an overlong line is already underway, so its
         // head goes out now and whatever follows is thrown away until
-        // its own newline ends it.
-        if !discarding && pending.len() >= CAPTURE_LINE_MAX {
+        // its own newline ends it. A line of exactly the bound still
+        // has room for its own newline in the next chunk, so only a
+        // longer one is cut.
+        if !discarding && pending.len() > CAPTURE_LINE_MAX {
             let head: Vec<u8> = pending.drain(..CAPTURE_LINE_MAX).collect();
             if send_line(&sender, head, true).is_err() {
                 return;
@@ -289,7 +330,7 @@ fn forward_stream<R: std::io::Read>(mut reader: R, sender: std::sync::mpsc::Send
 
 /// One line as one event, without its newline, marked when it was cut.
 fn send_line(
-    sender: &std::sync::mpsc::Sender<String>,
+    sender: &std::sync::mpsc::SyncSender<String>,
     mut bytes: Vec<u8>,
     cut: bool,
 ) -> Result<(), std::sync::mpsc::SendError<()>> {
@@ -354,13 +395,23 @@ impl App {
     }
 
     /// Keys and pastes while the pod prompt has the keyboard. `true`
-    /// when it took them; the mouse still reaches whatever is beneath.
+    /// when it took them. Anything else - the mouse, a resize, focus
+    /// loss - passes through to whatever is beneath, exactly as the
+    /// find bar and the quick action pass them on.
     ///
     /// The transport stays global, the way it does from the find bar:
     /// stopping the music works from a prompt. Quit is answered before
     /// this is offered.
     pub(super) fn pod_prompt_event(&mut self, terminal_event: &Event) -> bool {
         if self.pod_prompt.is_none() {
+            return false;
+        }
+        // Only keys and pastes are the prompt's; everything else - the
+        // mouse, a resize, focus loss - passes through to whatever is
+        // beneath, exactly as the find bar and the quick action pass
+        // them on. A key release reaches the body below, which keeps it
+        // from falling through to the surfaces under the prompt.
+        if !matches!(terminal_event, Event::Key(_)) && !matches!(terminal_event, Event::Paste(_)) {
             return false;
         }
         if let Event::Key(key) = terminal_event
@@ -553,7 +604,7 @@ impl App {
             .spawn();
         match spawn {
             Ok(mut child) => {
-                let (sender, receiver) = std::sync::mpsc::channel();
+                let (sender, receiver) = std::sync::mpsc::sync_channel(READ_QUEUE);
                 if let Some(stdout) = child.stdout.take() {
                     let sender = sender.clone();
                     std::thread::spawn(move || {
@@ -650,6 +701,7 @@ mod tests {
 
         use super::super::*;
         use crate::app::tests::support::*;
+        use crossterm::event::KeyEventState;
         use std::io::Cursor;
 
         fn pod_lines(app: &App) -> Vec<&str> {
@@ -705,6 +757,11 @@ mod tests {
                 "a placeholder inside a longer argument is replaced in place"
             );
             assert_eq!(
+                pod_arguments("my-agent {prompt}", "rewrite {file} please", set, None).unwrap(),
+                ["my-agent", "rewrite {file} please"],
+                "the prompt's own words are not re-expanded"
+            );
+            assert_eq!(
                 pod_arguments("", "anything", set, Some(file)),
                 None,
                 "an empty template is the feature off"
@@ -738,7 +795,7 @@ mod tests {
 
         #[test]
         fn a_long_line_is_cut_and_the_rest_read_away() {
-            let (sender, receiver) = std::sync::mpsc::channel();
+            let (sender, receiver) = std::sync::mpsc::sync_channel(READ_QUEUE);
             let head = "a".repeat(CAPTURE_LINE_MAX);
             let tail = "b".repeat(CAPTURE_LINE_MAX * 2);
             let mut stream = Vec::new();
@@ -755,6 +812,26 @@ mod tests {
                 "the line is cut to its head and marked"
             );
             assert_eq!(lines[1], "after the long line");
+        }
+
+        /// A line of exactly the per-line bound is whole: the cut is for
+        /// longer lines, and marking a complete line as cut would say
+        /// something was dropped when nothing was.
+        #[test]
+        fn a_line_of_exactly_the_bound_is_not_cut() {
+            let (sender, receiver) = std::sync::mpsc::sync_channel(READ_QUEUE);
+            let mut stream = Vec::new();
+            stream.extend_from_slice("a".repeat(CAPTURE_LINE_MAX).as_bytes());
+            stream.push(b'\n');
+            // The same line at the end of the stream, without a newline of
+            // its own, is whole too.
+            stream.extend_from_slice("b".repeat(CAPTURE_LINE_MAX).as_bytes());
+            forward_stream(Cursor::new(stream), sender);
+            let lines: Vec<String> = receiver.into_iter().collect();
+            assert_eq!(
+                lines,
+                vec!["a".repeat(CAPTURE_LINE_MAX), "b".repeat(CAPTURE_LINE_MAX),]
+            );
         }
 
         #[test]
@@ -823,6 +900,75 @@ mod tests {
             );
             press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
             assert!(app.pod_prompt.is_none());
+        }
+
+        /// Only keys and pastes are the prompt's. The mouse, a resize and
+        /// focus loss pass through to whatever is beneath - the find bar
+        /// and the quick action pass the same events on - while a key
+        /// release stays the prompt's, so it cannot fall through and
+        /// reach the surfaces under it.
+        #[test]
+        fn non_key_events_pass_through_beneath_the_prompt() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _) = plain_app(directory.path(), "$: s(\"bd\")\n");
+            app.ui_settings.pod_command = pod_command_configured();
+            app.open_pod_prompt(PodPromptKind::Request);
+            let mouse = Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 2,
+                row: 2,
+                modifiers: KeyModifiers::NONE,
+            });
+            assert!(
+                !app.pod_prompt_event(&mouse),
+                "the mouse is not the prompt's"
+            );
+            assert!(
+                !app.pod_prompt_event(&Event::Resize(80, 24)),
+                "nor a resize"
+            );
+            assert!(!app.pod_prompt_event(&Event::FocusLost), "nor focus loss");
+            let release = Event::Key(KeyEvent {
+                code: KeyCode::Char('x'),
+                modifiers: KeyModifiers::NONE,
+                kind: KeyEventKind::Release,
+                state: KeyEventState::NONE,
+            });
+            assert!(
+                app.pod_prompt_event(&release),
+                "a key release is consumed, not passed on"
+            );
+            assert_eq!(
+                app.pod_prompt.as_ref().expect("the prompt").text,
+                "",
+                "nothing in the release reached the text"
+            );
+            let press = Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+            assert!(app.pod_prompt_event(&press), "a key press is the prompt's");
+            assert_eq!(app.pod_prompt.as_ref().expect("the prompt").text, "x");
+        }
+
+        /// The window the prompt's one row shows is laid out in display
+        /// cells: wide characters still fit, and the caret column is
+        /// where the terminal draws the caret, not the character count.
+        #[test]
+        fn the_prompts_window_is_laid_out_in_cells() {
+            let mut prompt = PodPrompt {
+                kind: PodPromptKind::Request,
+                text: String::new(),
+                cursor: 0,
+                selected: false,
+            };
+            prompt.insert("夜に夜に");
+            let (shown, caret) = prompt.window(20);
+            assert_eq!(shown, "夜に夜に");
+            assert_eq!(caret, 8, "each wide character holds two cells");
+            // A window narrower than the text keeps the caret's own tail:
+            // one whole wide character fits before the caret's column,
+            // and the one before it is left out rather than half-drawn.
+            let (shown, caret) = prompt.window(4);
+            assert_eq!(shown, "に");
+            assert_eq!(caret, 2, "the caret column is inside the row");
         }
 
         #[test]
