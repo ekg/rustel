@@ -1251,9 +1251,8 @@ impl Ahead {
 
     /// The units to walk now, when `left` more queries of the run come
     /// before the cycle begins: an even share of the units that are left,
-    /// for the walks of the plan or for each query. Before the first walk
-    /// says how many units the cycle has, the plan guesses, and a cycle
-    /// with no plan walks one unit.
+    /// for the walks of the plan or for each query. The first walk of a
+    /// plan takes one unit, and a cycle with no plan walks one unit.
     pub(crate) fn share(&self, left: usize) -> std::ops::Range<usize> {
         let guess = self.plan.map_or(1, |plan| plan.units.max(1));
         let rest = self
@@ -1262,7 +1261,13 @@ impl Ahead {
         let walks = self
             .plan
             .map_or(left + 1, |plan| plan.walks.clamp(1, left + 1));
-        self.walked..self.walked + rest.div_ceil(walks)
+        // The first walk also finds the units of the cycle, which is work
+        // of its own: it takes one unit where more walks follow.
+        let share = match (self.units, walks) {
+            (None, 2..) => 1,
+            _ => rest.div_ceil(walks),
+        };
+        self.walked..self.walked + share
     }
 
     /// The units that are left, for the query that begins the cycle.
@@ -5580,6 +5585,23 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The walks of a planned cycle take each unit before the cycle
+    /// begins: the first walk one unit, and the walks after it even
+    /// shares of the rest.
+    #[test]
+    fn the_walks_of_a_cycle_take_each_unit_before_it_begins() {
+        let units = 12;
+        let mut ahead = Ahead::planned(40, units);
+        let mut shares = Vec::new();
+        for left in (0..7).rev() {
+            let share = ahead.share(left);
+            shares.push(share.len());
+            ahead.add(Vec::new(), true, share.end, units, Vec::new());
+        }
+        assert_eq!(shares, [1, 2, 2, 2, 2, 2, 1]);
+        assert!(ahead.is_whole());
     }
 
     #[test]
