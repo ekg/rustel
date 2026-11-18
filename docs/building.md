@@ -48,7 +48,7 @@ Optional features, combinable as needed:
 | Feature | Adds |
 | --- | --- |
 | `mp3-export` | MP3 export through LAME; included by default, independent of MP3 sample decoding |
-| `device-audio` | live playback through CPAL |
+| `device-audio` | live playback through CPAL - AAudio on Android, see [Android](#android-aaudio-cross-build) |
 | `midi` | MIDI input and output |
 | `gamepad` | native gamepad input, included by default; Linux builds require libudev headers |
 | `serial` | serial output for microcontrollers, included by default |
@@ -101,6 +101,78 @@ pkg-config --exists alsa && pkg-config --exists libudev && echo found
 A headless build without `device-audio`, `midi` and `gamepad` needs neither
 library. `rustelup --branch` and `--commit` run this check before they
 build and print the command for the detected distribution.
+
+## Android (AAudio) cross-build
+
+Live output on Android runs through CPAL's AAudio backend. cpal 0.18.2
+ships a real AAudio host for `target_os = "android"`, and it is the
+default host there, so the `device-audio` feature needs no extra gate:
+the device layer prefers PulseAudio only on Linux, and every other target
+- Android included - opens CPAL's default host. The live callback, the
+ring, meters and the insert-plugin pool are shared with the desktop
+platforms unchanged.
+
+Cross-compile with the NDK and `cargo-ndk`, both for `aarch64-linux-android`
+(`arm64-v8a`). Every cross-build on this setup also needs the dash-spelled
+`BINDGEN_EXTRA_CLANG_ARGS_aarch64-linux-android` variable: bindgen reads it
+before `cargo-ndk`'s underscore-spelled value, which names the NDK sysroot
+but no `--target`, and without a versioned triple bionic's `sys/cdefs.h`
+rejects the compile:
+
+```sh
+NDK=$HOME/android-sdk/ndk/<version>
+SYSROOT=$NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot
+env \
+  ANDROID_NDK_HOME=$NDK \
+  "BINDGEN_EXTRA_CLANG_ARGS_aarch64-linux-android=--target=aarch64-linux-android29 --sysroot=$SYSROOT -I$SYSROOT/usr/include/aarch64-linux-android" \
+  cargo ndk -t aarch64-linux-android -P 29 \
+  build -p rustel --no-default-features --features device-audio,midi
+```
+
+The `-P 29` API level is a link requirement of the live path: AAudio's
+`libaaudio` first ships at API 26, and with `midi` enabled midir's AMidi
+backend also links `libamidi`, which first ships at API 29. A live-path
+binary without `midi` needs only the AAudio level, 26.
+
+`device-audio,midi` is the lean feature combination for the command's
+live path. `device-audio` without `midi` does not build the command on any
+platform: the live command's Link timing reads the runtime's `midi_clock`
+module, which the `midi` feature gates.
+
+The studio does not cross-compile: `arboard`, its clipboard dependency,
+has no Android backend.
+
+Runtime behavior on Android, as far as the code shows (validated to the
+link; no Android device was attached at the time of writing):
+
+- A live stream opens only inside a JVM-bearing Android app. CPAL's AAudio
+  output queries the platform's AudioManager over JNI after opening the
+  stream, and device enumeration goes through JNI the same way; both call
+  `ndk_context::android_context()`, which panics in a process that has
+  not initialized it. A bare `adb shell` or Termux binary therefore
+  cannot open live output. The supported route is an app that embeds
+  Rustel through the `rustel-android-host` crate and calls
+  `ndk_context::initialize_android_context` with its JavaVM and Activity
+  context before playback.
+- Without a JNI device listing, CPAL falls back to a single unnamed
+  default device, so `--output` with a device name has nothing to match.
+- The callback runs with the platform's ordinary scheduling. No plugin
+  worker threads start on Android - the worker pool reads the system's
+  performance cores, which Android does not report - so insert plugins
+  render on the audio callback, and no thread asks for a real-time class.
+- The default 128-frame live buffer reaches AAudio as
+  `frames_per_data_callback = 128` with a 256-frame capacity. CPAL's own
+  underrun-driven buffer growth stays off because the request is fixed,
+  and CPAL's `realtime` feature, which would ask AAudio for its
+  low-latency performance mode explicitly, is not enabled.
+- Device loss is not recovered on any platform, and Android disconnects
+  AAudio streams on route changes such as headphones or Bluetooth: the
+  failure is reported through the live path's error reporting rather than
+  reopened. Xrun counts come from AAudio and are reported the same way as
+  on the desktop.
+- CPAL's AAudio host provides input streams and Rustel's input path
+  compiles for Android, but the same JNI requirement applies, and input
+  is untested on hardware.
 
 Visuals need no separate system graphics library. Procedural and camera
 visuals need no network, while `initImage()`
