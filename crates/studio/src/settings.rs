@@ -622,6 +622,92 @@ impl ExternalChanges {
     }
 }
 
+/// Which pod the pod prompt hands the score to. The rows below the kind
+/// configure the kind it names: the command template for `command`, the
+/// endpoint, model and key for `llm`. `agent` is selectable but nothing
+/// answers for it yet.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PodKind {
+    /// The command template: an external program, run with no shell.
+    #[default]
+    Command,
+    /// One chat call to an OpenAI-compatible endpoint, which answers
+    /// with the rewritten score.
+    Llm,
+    /// A built-in agent pod. Not built yet: submitting a prompt while
+    /// this rung is chosen is refused.
+    Agent,
+}
+
+impl PodKind {
+    const LADDER: [Self; 3] = [Self::Command, Self::Llm, Self::Agent];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Command => "command",
+            Self::Llm => "llm",
+            Self::Agent => "agent",
+        }
+    }
+
+    /// The name the preferences file keeps.
+    pub fn key(self) -> &'static str {
+        self.label()
+    }
+
+    pub fn parse(text: &str) -> Self {
+        Self::LADDER
+            .iter()
+            .copied()
+            .find(|kind| kind.key() == text)
+            .unwrap_or_default()
+    }
+
+    fn step(self, forwards: bool) -> Self {
+        let index = Self::LADDER
+            .iter()
+            .position(|candidate| *candidate == self)
+            .unwrap_or(0);
+        let len = Self::LADDER.len();
+        Self::LADDER[if forwards {
+            (index + 1) % len
+        } else {
+            (index + len - 1) % len
+        }]
+    }
+}
+
+/// The environment variable that holds the llm pod's API key instead of
+/// the settings row. It wins over the stored row, so a key a shell
+/// already holds never has to be typed into the preferences file, which
+/// keeps it as plain text.
+pub const LLM_KEY_ENV: &str = "RUSTEL_LLM_KEY";
+
+/// The llm key row's value: never the whole key, because a settings
+/// sheet is read over shoulders. `environment` when [`LLM_KEY_ENV`]
+/// holds a non-empty key, which wins over the stored row and makes it
+/// inert; otherwise enough of the stored key to recognise it - `set`
+/// when it is too short to show a piece of, `not set` when there is
+/// none.
+pub fn llm_key_readout(stored: &str) -> String {
+    if std::env::var(LLM_KEY_ENV).is_ok_and(|key| !key.trim().is_empty()) {
+        return "environment".to_owned();
+    }
+    let stored = stored.trim();
+    if stored.is_empty() {
+        return "not set".to_owned();
+    }
+    // Keys are long random strings; showing the head and tail is a
+    // convention for telling two of them apart without giving one away.
+    let characters: Vec<char> = stored.chars().collect();
+    if characters.len() <= 8 {
+        return "set".to_owned();
+    }
+    let head: String = characters[..3].iter().collect();
+    let tail: String = characters[characters.len() - 4..].iter().collect();
+    format!("{head}\u{2026}{tail}")
+}
+
 /// How long a sounding mark lingers after its event ends.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum HighlightFade {
@@ -1763,10 +1849,25 @@ pub struct UiSettings {
     /// What the studio does when another program saves the open score's
     /// file. Off by default: reading the file again is opted into.
     pub external_changes: ExternalChanges,
-    /// The command template the pod prompt runs, with `{prompt}`, `{set}`
-    /// and `{file}` placeholders. Empty by default: the pod is opted
-    /// into by configuring one. See `app/pod.rs`.
+    /// The command template the pod prompt runs when the pod kind is
+    /// `command`, with `{prompt}`, `{set}` and `{file}` placeholders.
+    /// Empty by default: the pod is opted into by configuring one. See
+    /// `app/pod.rs`.
     pub pod_command: String,
+    /// Which pod the prompt runs: the command template, an llm rewrite,
+    /// or the agent pod that is not built yet.
+    pub pod_kind: PodKind,
+    /// The base URL the llm pod posts to: the part ahead of
+    /// `/chat/completions`, for example `https://api.openai.com/v1`.
+    /// Empty by default, which leaves llm pods refused rather than
+    /// guessed.
+    pub llm_endpoint: String,
+    /// The model the llm pod names in its request. Empty by default.
+    pub llm_model: String,
+    /// The API key the llm pod sends. Kept in the preferences file as
+    /// plain text; [`LLM_KEY_ENV`] in the environment wins over it, for
+    /// players who would rather not store the key at all.
+    pub llm_api_key: String,
     /// Whether an update renames the score's file to its `@title` field.
     /// Off by default: a file's name is the player's own arrangement, and
     /// files that moved on their own would be a surprise the first time.
@@ -1956,6 +2057,10 @@ impl Default for UiSettings {
             typing_pause: TypingPause::Medium,
             external_changes: ExternalChanges::Off,
             pod_command: String::new(),
+            pod_kind: PodKind::Command,
+            llm_endpoint: String::new(),
+            llm_model: String::new(),
+            llm_api_key: String::new(),
             sync_name_from_title: true,
             load_mode: LoadMode::Wait,
             clock_out: None,
@@ -2051,6 +2156,17 @@ impl UiSettings {
             .filter(|category| !self.shows_category(*category))
     }
 
+    /// The API key an llm pod sends: [`LLM_KEY_ENV`] from the environment
+    /// when it holds a non-empty one, the stored row otherwise. The
+    /// environment wins, so a key a shell already holds does not have to
+    /// be typed into the preferences file, which keeps it as plain text.
+    pub fn llm_key(&self) -> String {
+        std::env::var(LLM_KEY_ENV)
+            .ok()
+            .filter(|key| !key.trim().is_empty())
+            .unwrap_or_else(|| self.llm_api_key.clone())
+    }
+
     /// Make the switches current; the tier is set by the caller, who knows
     /// the terminal.
     pub fn apply(&self) {
@@ -2078,9 +2194,19 @@ enum Row {
     TypingPause,
     /// What happens when another program saves the open score's file.
     ExternalChanges,
-    /// The command the pod prompt hands the score to. Empty hides the
-    /// feature; Enter edits the template. See `app/pod.rs`.
+    /// Which pod the pod prompt hands the score to: the command template
+    /// below, an llm rewrite, or the agent pod that is not built yet.
+    PodKind,
+    /// The command the pod prompt hands the score to when the kind is
+    /// `command`. Empty hides the feature; Enter edits the template. See
+    /// `app/pod.rs`.
     PodCommand,
+    /// The base URL the llm pod posts to; Enter edits it.
+    LlmEndpoint,
+    /// The model the llm pod names; Enter edits it.
+    LlmModel,
+    /// The API key the llm pod sends; Enter edits it.
+    LlmApiKey,
     /// Whether an update renames the score's file to its `@title` field.
     SyncNameFromTitle,
     /// How a start or an edit meets sounds still loading.
@@ -2303,7 +2429,11 @@ const ROWS: &[Row] = &[
     Row::AutoEvaluate,
     Row::TypingPause,
     Row::ExternalChanges,
+    Row::PodKind,
     Row::PodCommand,
+    Row::LlmEndpoint,
+    Row::LlmModel,
+    Row::LlmApiKey,
     Row::SyntaxCheck,
     Row::SetsFolder,
     Row::RecordingsFolder,
@@ -2442,6 +2572,22 @@ pub fn pod_command_row() -> usize {
         .expect("the pod command row is on the first page")
 }
 
+/// The pod kind row's place on the General page, for the tests that
+/// walk the sheet to it.
+pub fn pod_kind_row() -> usize {
+    ROWS.iter()
+        .position(|row| matches!(row, Row::PodKind))
+        .expect("the pod kind row is on the first page")
+}
+
+/// The llm endpoint row's place on the General page, for the tests that
+/// walk the sheet to it.
+pub fn llm_endpoint_row() -> usize {
+    ROWS.iter()
+        .position(|row| matches!(row, Row::LlmEndpoint))
+        .expect("the llm endpoint row is on the first page")
+}
+
 pub(super) fn keybind_action_at(row: usize) -> Option<BindAction> {
     row.checked_sub(KEYBIND_ACTION_START)
         .and_then(|index| BindAction::ALL.get(index).copied())
@@ -2532,9 +2678,14 @@ impl Row {
     fn group(self) -> &'static str {
         match self {
             Self::Quantise | Self::MasterLimiter | Self::LoadMode => "Playback",
-            Self::AutoEvaluate | Self::TypingPause | Self::ExternalChanges | Self::PodCommand => {
-                "Live coding"
-            }
+            Self::AutoEvaluate
+            | Self::TypingPause
+            | Self::ExternalChanges
+            | Self::PodKind
+            | Self::PodCommand
+            | Self::LlmEndpoint
+            | Self::LlmModel
+            | Self::LlmApiKey => "Live coding",
 
             // The one latency knob: what the OUTPUT costs is a
             // machine-level choice, set once like a DAW's buffer size.
@@ -2602,7 +2753,11 @@ impl Row {
             Self::AutoEvaluate => "auto evaluate",
             Self::TypingPause => "typing pause",
             Self::ExternalChanges => "watch external changes",
+            Self::PodKind => "pod kind",
             Self::PodCommand => "pod command",
+            Self::LlmEndpoint => "llm endpoint",
+            Self::LlmModel => "llm model",
+            Self::LlmApiKey => "llm key",
             Self::LoadMode => "load mode",
             Self::Animation => "visualizers",
             Self::Highlights => "highlights",
@@ -2690,8 +2845,14 @@ impl Row {
             Self::ExternalChanges => {
                 "sync: the editor takes another program's save \u{b7} sync & eval: and plays it"
             }
+            Self::PodKind => "which pod the prompt runs \u{b7} agent is not built yet",
             Self::PodCommand => {
                 "the agent the pod prompt runs \u{b7} {prompt} {set} {file} \u{b7} Enter edits it"
+            }
+            Self::LlmEndpoint => "base URL ahead of /chat/completions \u{b7} Enter edits it",
+            Self::LlmModel => "the model the rewrite request names \u{b7} Enter edits it",
+            Self::LlmApiKey => {
+                "stored as plain text in the preferences \u{b7} RUSTEL_LLM_KEY in the environment wins over it"
             }
             Self::LoadMode => "wait: plays once its sounds load · async: skips late notes",
             Self::Animation => "pianoroll, scope and friends draw",
@@ -3034,6 +3195,12 @@ pub enum SettingsAction {
     ChooseRecordingsFolder,
     /// Enter on the pod command row: the sheet hands over to a prompt.
     EditPodCommand,
+    /// Enter on the llm endpoint row: the sheet hands over to a prompt.
+    EditLlmEndpoint,
+    /// Enter on the llm model row: the sheet hands over to a prompt.
+    EditLlmModel,
+    /// Enter on the llm key row: the sheet hands over to a prompt.
+    EditLlmApiKey,
     EditVimMappingsPath,
     ResetVimMappingsPath,
     /// Enter on the sample cache row: empty it. Armed by a first Enter;
@@ -3793,6 +3960,7 @@ impl SettingsSheet {
                 Row::ExternalChanges => {
                     settings.external_changes = settings.external_changes.step(forwards);
                 }
+                Row::PodKind => settings.pod_kind = settings.pod_kind.step(forwards),
                 Row::LoadMode => settings.load_mode = settings.load_mode.step(),
                 Row::Animation => set_switch(&mut settings.animation),
                 Row::Highlights => set_switch(&mut settings.highlights),
@@ -3883,6 +4051,9 @@ impl SettingsSheet {
                 | Row::SetsFolder
                 | Row::RecordingsFolder
                 | Row::PodCommand
+                | Row::LlmEndpoint
+                | Row::LlmModel
+                | Row::LlmApiKey
                 | Row::CacheDefaults
                 | Row::RefreshSources
                 | Row::SampleCache => {}
@@ -3964,6 +4135,9 @@ impl SettingsSheet {
                     Some(scope) => SettingsAction::OpenPrebake(scope),
                     None if row == Some(&Row::SetsFolder) => SettingsAction::ChooseSetsFolder,
                     None if row == Some(&Row::PodCommand) => SettingsAction::EditPodCommand,
+                    None if row == Some(&Row::LlmEndpoint) => SettingsAction::EditLlmEndpoint,
+                    None if row == Some(&Row::LlmModel) => SettingsAction::EditLlmModel,
+                    None if row == Some(&Row::LlmApiKey) => SettingsAction::EditLlmApiKey,
                     None if row == Some(&Row::RecordingsFolder) => {
                         SettingsAction::ChooseRecordingsFolder
                     }
@@ -10002,5 +10176,28 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("▸ Kick"), "{text}");
+    }
+
+    /// The llm key row never shows the whole key: a settings sheet is
+    /// read over shoulders. The environment's key wins over the stored
+    /// row and the row says so, so a typed key that is not the one in
+    /// effect does not read as a mystery.
+    #[test]
+    fn the_llm_key_row_never_shows_the_whole_key() {
+        assert_eq!(llm_key_readout(""), "not set");
+        assert_eq!(llm_key_readout("  \n"), "not set");
+        assert_eq!(
+            llm_key_readout("short"),
+            "set",
+            "too short to show a piece of"
+        );
+        assert_eq!(llm_key_readout("sk-abcdef123456"), "sk-\u{2026}3456");
+        // SAFETY: process-global environment, mutated only here, while
+        // this test holds it; the suite runs one test at a time unless
+        // told otherwise, and no other test reads this variable.
+        unsafe { std::env::set_var(LLM_KEY_ENV, "env-key") };
+        assert_eq!(llm_key_readout("sk-abcdef123456"), "environment");
+        unsafe { std::env::remove_var(LLM_KEY_ENV) };
+        assert_eq!(llm_key_readout("sk-abcdef123456"), "sk-\u{2026}3456");
     }
 }

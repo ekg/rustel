@@ -36,7 +36,7 @@
 //! | files dropped on the studio, bank rename | `sample_import.rs` |
 //! | the prebake tabs: global and per-set setup | `prebakes.rs` |
 //! | ^J, the quick action at the caret | `smart_action.rs` |
-//! | the pod prompt, and the pod command it runs | `pod.rs` |
+//! | the pod prompt, and the command or llm pod it runs | `pod.rs` |
 //! | the computer piano | `piano_mode.rs` |
 //! | jumping to the first error | `error_navigation.rs` |
 //! | pasting into prompts | `prompt_paste.rs` |
@@ -120,8 +120,8 @@ use super::save::{SaveRequest, SaveResult, SaveWorker};
 use super::scenes::{PendingSave, SceneError, SceneId, SceneSet, SetLimiter};
 use super::set_panel::{SetLine, SetPanel};
 use super::settings::{
-    self, ExternalChanges, OutputLatency, SettingsAction, SettingsNavigation, SettingsSheet,
-    SyntaxCheck, UiSettings,
+    self, ExternalChanges, OutputLatency, PodKind, SettingsAction, SettingsNavigation,
+    SettingsSheet, SyntaxCheck, UiSettings,
 };
 use super::terminal::TerminalSession;
 use super::terminal::{TerminalFeatures, cell_pixels_now};

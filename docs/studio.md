@@ -413,15 +413,29 @@ text, including edits that are not saved yet. Studio does not merge the two.
 
 ### Pods
 
-A pod is an external command that takes a prompt and rewrites score files:
-an AI agent CLI, a script of your own, anything at all. Configure it under
-Settings ▸ Live coding ▸ pod command as a template, press ^⇧J, type a
-prompt, and press Enter. Studio runs the command in the background with the
-set folder as its working directory; what the pod writes, the
-[external changes](#external-changes) watch follows - `sync` takes the saved
-text into the editor, and `sync & eval` opens the score's tab and plays it.
-That watch is off by default, so turn it on there too: until it is on, the
-pod's writes land in the files and Studio does not follow them.
+A pod is what the pod prompt hands the score to. Press ^⇧J, type a prompt,
+and press Enter; which pod answers is the **pod kind** row, under
+Settings ▸ Live coding:
+
+| Kind | What runs |
+| --- | --- |
+| `command` | the command template below - an external program, run with no shell |
+| `llm` | one chat call to an OpenAI-compatible endpoint, which answers with the rewritten score |
+| `agent` | a built-in agent pod - not built yet; the prompt refuses while this kind is chosen |
+
+All the rows start empty, so until one is filled in the prompt answers with
+where to go.
+
+#### The command pod
+
+The command template is any command that takes a prompt and writes score
+files: an AI agent CLI, a script of one's own, anything at all. Studio runs
+the command in the background with the set folder as its working directory;
+what the pod writes, the [external changes](#external-changes) watch follows
+- `sync` takes the saved text into the editor, and `sync & eval` opens the
+score's tab and plays it. That watch is off by default, so turn it on there
+too: until it is on, the pod's writes land in the files and Studio does not
+follow them.
 
 The template is split on whitespace into the command's arguments; there is no
 shell, so nothing in it is quoted, escaped or expanded by anything else. Three
@@ -444,18 +458,47 @@ my-agent --prompt {prompt} --file {file}
 ```
 
 The pod's stdout and stderr arrive line by line in the Log under `pod`, kept
-to a bounded tail (the last 200 lines and 64 KB). A running pod is a row in
-the jobs sheet and the header's chip; the footer says when it finished or
-failed. At most one pod runs at a time - a prompt submitted while one runs
-is refused, because two of them writing one file is a race nobody asked for.
-There is no cancellation for the same reason: killing a pod mid-write leaves
-a half-written score. The pod runs unattended, with its input closed, so
-configure it for non-interactive use. An empty pod command hides the feature:
-the prompt answers with where to set one.
+to a bounded tail (the last 200 lines and 64 KB).
 
-A terminal that cannot tell ^⇧J from ^J, or keeps ^⇧J for itself, leaves the
-pod prompt without a chord; learn one on Settings ▸ Keybinds, the way the
-knobs column's chord is learnt there.
+#### The llm pod
+
+The llm pod makes one OpenAI-compatible chat call and takes the reply as the
+complete rewritten score. Three rows configure it, beside the kind row:
+
+- **llm endpoint** - the base URL ahead of `/chat/completions`, for example
+  `https://api.openai.com/v1` or a local server's `http://127.0.0.1:8080/v1`.
+  Enter on the row edits it.
+- **llm model** - the model the request names. Enter edits it.
+- **llm key** - the API key, sent only in the request's `Authorization`
+  header. Enter edits it; the row never shows the whole key.
+
+The key can also come from the `RUSTEL_LLM_KEY` environment variable, which
+wins over the stored row. That is the way to keep a key out of the
+preferences file, because the stored row is plain text at rest: anything
+that can read `studio.json` can read the key.
+
+Submitting a prompt sends the rewrite on a background thread - the core's
+system prompt, the active tab's current score, and your prompt - and the call
+is bounded by a sixty-second timeout. On success the returned score replaces
+the active tab's text, is written to its file, and is evaluated like an
+update: no external-changes setting is needed, because the pane is Studio's
+own. On failure the error lands in the Log under `pod`, its message naming
+the kind of failure (the endpoint's status, a transport fault, a reply that
+was not the chat JSON it promised), and the editor is untouched. A reply that
+is not a valid score is refused the way an update refuses one: the last good
+score keeps playing and the log says why.
+
+#### All kinds
+
+A running pod is a row in the jobs sheet and the header's chip; the footer
+says when it finished or failed. At most one pod runs at a time, whatever
+the kind - a prompt submitted while one runs is refused, because two of them
+writing one file is a race nobody asked for. There is no cancellation for
+the same reason: killing a pod mid-write leaves a half-written score. The
+command pod runs unattended, with its input closed, so configure it for
+non-interactive use. A terminal that cannot tell ^⇧J from ^J, or keeps ^⇧J for
+itself, leaves the pod prompt without a chord; learn one on
+Settings ▸ Keybinds, the way the knobs column's chord is learnt there.
 
 ### Sync with score metadata
 

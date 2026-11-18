@@ -707,6 +707,7 @@ impl App {
                     settings.auto_evaluate != self.ui_settings.auto_evaluate;
                 let external_changes_changed =
                     settings.external_changes != self.ui_settings.external_changes;
+                let pod_kind_changed = settings.pod_kind != self.ui_settings.pod_kind;
                 // A set with a limiter of its own keeps it, so the row can
                 // change the default and this set go on sounding the same.
                 // That is the design, but it is not obvious from the sheet,
@@ -845,6 +846,17 @@ impl App {
                         }
                     }
                     .into();
+                } else if pod_kind_changed {
+                    self.status = match self.ui_settings.pod_kind {
+                        PodKind::Command => {
+                            "pod kind command - the pod command template runs the prompt"
+                        }
+                        PodKind::Llm => {
+                            "pod kind llm - the endpoint, model and key rows run the rewrite"
+                        }
+                        PodKind::Agent => "pod kind agent - not built yet; the pod prompt refuses",
+                    }
+                    .into();
                 } else if webcam_confirmed {
                     self.status =
                         "webcam on - the picture stays up while this row is selected".into();
@@ -896,6 +908,29 @@ impl App {
             SettingsAction::EditPodCommand => {
                 self.settings_sheet = Some(sheet);
                 self.open_pod_prompt(super::pod::PodPromptKind::Command);
+                #[cfg(feature = "hydra")]
+                self.sync_settings_webcam_preview();
+                return true;
+            }
+            // The sheet hands over to the llm rows' own prompts, the same
+            // way: over the sheet, back to it on Esc.
+            SettingsAction::EditLlmEndpoint => {
+                self.settings_sheet = Some(sheet);
+                self.open_pod_prompt(super::pod::PodPromptKind::Endpoint);
+                #[cfg(feature = "hydra")]
+                self.sync_settings_webcam_preview();
+                return true;
+            }
+            SettingsAction::EditLlmModel => {
+                self.settings_sheet = Some(sheet);
+                self.open_pod_prompt(super::pod::PodPromptKind::Model);
+                #[cfg(feature = "hydra")]
+                self.sync_settings_webcam_preview();
+                return true;
+            }
+            SettingsAction::EditLlmApiKey => {
+                self.settings_sheet = Some(sheet);
+                self.open_pod_prompt(super::pod::PodPromptKind::Key);
                 #[cfg(feature = "hydra")]
                 self.sync_settings_webcam_preview();
                 return true;
@@ -2123,7 +2158,7 @@ mod tests {
             // Down to the machine rows at the page's end, onto max
             // polyphony: past the set rows, the load mode and the output
             // buffer.
-            for _ in 0..16 {
+            for _ in 0..20 {
                 press(&mut app, KeyCode::Down, KeyModifiers::NONE);
             }
             press(&mut app, KeyCode::Right, KeyModifiers::NONE);
@@ -2146,7 +2181,7 @@ mod tests {
             app.settings_sheet = Some(sheet);
             app.focus = Focus::Panel(PanelKind::Settings);
             // Down onto the load mode, past the set rows.
-            for _ in 0..14 {
+            for _ in 0..18 {
                 press(&mut app, KeyCode::Down, KeyModifiers::NONE);
             }
             press(&mut app, KeyCode::Right, KeyModifiers::NONE);

@@ -85,6 +85,22 @@ pub struct StudioPrefs {
     /// opted into by configuring a command.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pod_command: Option<String>,
+    /// Which pod the prompt runs: `command`, `llm` or `agent`. Absent is
+    /// command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pod_kind: Option<String>,
+    /// The base URL the llm pod posts to: the part ahead of
+    /// `/chat/completions`. Absent or empty leaves llm pods refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm_endpoint: Option<String>,
+    /// The model the llm pod names in its request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm_model: Option<String>,
+    /// The API key the llm pod sends. The preferences file keeps it as
+    /// plain text; the `RUSTEL_LLM_KEY` environment variable, when set,
+    /// wins over it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm_api_key: Option<String>,
     /// Whether an update renames the score's file to its `@title` field.
     /// Absent is off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -828,6 +844,14 @@ impl StudioPrefs {
                 .map(super::settings::ExternalChanges::parse)
                 .unwrap_or(defaults.external_changes),
             pod_command: self.pod_command.clone().unwrap_or_default(),
+            pod_kind: self
+                .pod_kind
+                .as_deref()
+                .map(super::settings::PodKind::parse)
+                .unwrap_or_default(),
+            llm_endpoint: self.llm_endpoint.clone().unwrap_or_default(),
+            llm_model: self.llm_model.clone().unwrap_or_default(),
+            llm_api_key: self.llm_api_key.clone().unwrap_or_default(),
             sync_name_from_title: self
                 .sync_name_from_title
                 .unwrap_or(defaults.sync_name_from_title),
@@ -1035,6 +1059,10 @@ impl StudioPrefs {
         self.typing_pause = Some(settings.typing_pause.key().to_owned());
         self.external_changes = Some(settings.external_changes.key().to_owned());
         self.pod_command = Some(settings.pod_command.clone());
+        self.pod_kind = Some(settings.pod_kind.key().to_owned());
+        self.llm_endpoint = Some(settings.llm_endpoint.clone());
+        self.llm_model = Some(settings.llm_model.clone());
+        self.llm_api_key = Some(settings.llm_api_key.clone());
         self.sync_name_from_title = Some(settings.sync_name_from_title);
         self.load_mode = Some(settings.load_mode.key().to_owned());
         self.animation = Some(settings.animation);

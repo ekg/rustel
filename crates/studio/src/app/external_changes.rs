@@ -287,8 +287,10 @@ impl App {
         ReloadOutcome::Adopted
     }
 
-    /// What an edit made outside the studio owes the studio.
-    fn note_external_change(&mut self, scene_id: SceneId, now: Instant) {
+    /// What an edit made outside the studio owes the studio. Also owed
+    /// by the llm pod's rewrite, which arrives the same way: text the
+    /// editor adopts without a keypress.
+    pub(super) fn note_external_change(&mut self, scene_id: SceneId, now: Instant) {
         self.last_edit_at = now;
         self.lint_pending = true;
         // The pause that was owed belonged to text this reload replaced.

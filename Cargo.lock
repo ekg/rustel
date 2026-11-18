@@ -4715,6 +4715,7 @@ dependencies = [
  "rustel-midi",
  "rustel-mini",
  "rustel-osc",
+ "rustel-pod-llm",
  "rustel-runtime",
  "rustel-scheduler",
  "rustel-serial",

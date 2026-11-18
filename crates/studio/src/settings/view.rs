@@ -120,6 +120,23 @@ impl Widget for SettingsSheetView<'_> {
                         self.settings.pod_command.trim().to_owned()
                     }
                 }
+                Row::PodKind => self.settings.pod_kind.label().to_owned(),
+                Row::LlmEndpoint => {
+                    if self.settings.llm_endpoint.trim().is_empty() {
+                        "not set".to_owned()
+                    } else {
+                        self.settings.llm_endpoint.trim().to_owned()
+                    }
+                }
+                Row::LlmModel => {
+                    if self.settings.llm_model.trim().is_empty() {
+                        "not set".to_owned()
+                    } else {
+                        self.settings.llm_model.trim().to_owned()
+                    }
+                }
+                // Never the whole key: the sheet is read over shoulders.
+                Row::LlmApiKey => llm_key_readout(&self.settings.llm_api_key),
                 Row::LoadMode => self.settings.load_mode.label().to_owned(),
                 Row::Animation => on_off(self.settings.animation),
                 Row::Highlights => on_off(self.settings.highlights),
