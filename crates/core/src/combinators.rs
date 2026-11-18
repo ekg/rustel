@@ -140,6 +140,13 @@ pub fn ply<P: PatOps>(pat: &P, factor: Fraction) -> P {
         Ok(steps) => steps,
         Err(refused) => return refused,
     };
+    // A whole count of each step of a sequence is a sequence.
+    let count = (factor.denom() == 1)
+        .then(|| usize::try_from(factor.numer()).ok())
+        .flatten();
+    if let Some(plied) = count.and_then(|count| pat.plied(count)) {
+        return plied.set_steps(steps);
+    }
     pat.squeeze_bind(move |v| checked_fast(&P::pat_pure(v.clone()), factor, "ply"))
         .set_steps(steps)
 }

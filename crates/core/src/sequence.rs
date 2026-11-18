@@ -1927,6 +1927,65 @@ pub(crate) fn faster(pattern: &Pattern, factor: Fraction) -> Option<Pattern> {
     Some(node_of_sound(layers))
 }
 
+/// `pattern` with each step `count` times in the time of the step, one
+/// after the other: what a `ply` makes of a sequence of whole steps of
+/// data, with no join at each query. `None` for any other pattern, for a
+/// step that is cut or has no width, for more than [`MAX_FOLDED_STEPS`]
+/// steps in a layer, and for a step that begins before the step before it
+/// ends: the join answers each of the one step and then each of the
+/// other, which is not the order of time that a layer has.
+pub(crate) fn plied(pattern: &Pattern, count: usize) -> Option<Pattern> {
+    let layers = layers(pattern)?;
+    let share = Fraction::int(i128::try_from(count).ok().filter(|count| *count > 0)?);
+    let layers = layers
+        .iter()
+        .map(|layer| {
+            let steps = layer.places();
+            let listed = steps.len().checked_mul(count)?;
+            if !layer.data || listed > MAX_FOLDED_STEPS {
+                return None;
+            }
+            let mut places = Vec::with_capacity(listed);
+            let mut before = None;
+            for step in steps.iter() {
+                let (begin, end) = (step.whole.begin, step.whole.end);
+                let sounds_on = count > 1 && before.is_some_and(|before| begin < before);
+                if step.part.is_some() || begin >= end || sounds_on {
+                    return None;
+                }
+                before = Some(end);
+                let width = end.checked_sub(begin)?.checked_div(share)?;
+                let mut from = begin;
+                for at in 1..=count {
+                    // The last one ends where the step ends.
+                    let to = match at == count {
+                        true => end,
+                        false => {
+                            let at = Fraction::int(i128::try_from(at).ok()?);
+                            begin.checked_add(width.checked_mul(at)?)?
+                        }
+                    };
+                    // A handle of the locations of the step.
+                    let locations = step.locations.clone();
+                    places.push(Place::at(
+                        TimeSpan::new(from, to),
+                        None,
+                        step.value,
+                        locations,
+                    ));
+                    from = to;
+                }
+            }
+            let places: Arc<[Place]> = places.into();
+            Some(layer.with(|layer| {
+                layer.in_cycles = lie_in_cycles(layer.period, &places);
+                layer.steps = Steps::Places(Listed::new(places));
+            }))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(node_of_sound(layers))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2103,6 +2162,36 @@ mod tests {
 
     fn built(layers: &[SequenceLayer]) -> Pattern {
         sequence(layers.to_vec()).expect("sound layers")
+    }
+
+    /// A ply of a sequence by a whole count is one sequence, which answers
+    /// as the join of a pattern for each step. A count that is not whole,
+    /// a step that is cut, and more steps than a fold lists keep the join.
+    #[test]
+    fn a_ply_of_a_sequence_answers_as_the_join_of_each_step() {
+        use crate::combinators::ply;
+        let is_sequence = |pattern: &Pattern| matches!(pattern.node_kind(), Node::Sequence(_));
+        let stepped = |layers: &[SequenceLayer]| built(layers).with_steps(Some(frac((4, 1))));
+        for (name, layers) in sequences() {
+            // The steps of a chord sound at one time.
+            let chord = name == "a chord and fast steps";
+            for count in [1, 2, 3, 7] {
+                let plied = || ply(&stepped(&layers), frac((count, 1)));
+                let folded = plied();
+                let name = format!("{name}, each step {count} times");
+                assert_eq!(is_sequence(&folded), !chord || count == 1, "{name}");
+                assert_same_answers(&name, &folded, &unfolded(plied));
+            }
+            assert!(!is_sequence(&ply(&built(&layers), frac((3, 2)))), "{name}");
+            assert!(
+                !is_sequence(&ply(&built(&layers), frac((300, 1)))),
+                "{name}"
+            );
+        }
+        let whole = (frac((0, 1)), frac((3, 4)));
+        let cut = step((0, 1), (3, 4), 1.0).placed(whole, (frac((1, 4)), frac((1, 2))));
+        let cut = built(&[layer((2, 1), vec![cut])]);
+        assert!(!is_sequence(&ply(&cut, frac((2, 1)))));
     }
 
     /// A lane whose second application raises a query error at each query.

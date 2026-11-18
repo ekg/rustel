@@ -233,6 +233,10 @@ pub trait PatOps: Clone + Sized + Send + Sync + 'static {
     /// with no pattern of a number. `None` when the pattern takes no run of
     /// numbers so: the caller then composes each.
     fn met_numbers(&self, numbers: &[(crate::compose::ComposeOp, f64)]) -> Option<Self>;
+    /// This pattern with each step `count` times in its time, in one
+    /// sequence. `None` when the pattern is no sequence of whole steps of
+    /// data: the caller then joins a pattern for each hap.
+    fn plied(&self, count: usize) -> Option<Self>;
     /// `app_*_with_lookup` of [`crate::compose::compose_op`] for `op`.
     fn app_left_composed(
         &self,
@@ -575,6 +579,9 @@ impl PatOps for Pattern {
     }
     fn met_numbers(&self, numbers: &[(crate::compose::ComposeOp, f64)]) -> Option<Self> {
         Pattern::met_numbers(self, numbers)
+    }
+    fn plied(&self, count: usize) -> Option<Self> {
+        crate::sequence::plied(self, count)
     }
     fn app_left_composed(
         &self,
@@ -972,6 +979,10 @@ impl PatOps for PurePattern {
         self.pattern()
             .met_numbers(numbers)
             .map(PurePattern::assert_pure)
+    }
+    fn plied(&self, count: usize) -> Option<Self> {
+        // Steps of data are as pure as their receiver.
+        crate::sequence::plied(self.pattern(), count).map(PurePattern::assert_pure)
     }
     fn app_left_composed(
         &self,
