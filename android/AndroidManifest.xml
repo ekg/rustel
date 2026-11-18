@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The Rustel Android app. Built by build-apk.sh without Gradle; see
+     android/README.md for the steps and the device requirements. The
+     application is marked debuggable because the APK is debug-signed: it
+     lets `adb shell run-as` read a render from the app's private storage. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="dev.rustel.android">
+
+    <!-- Offline renders need no network, but a score that fetches samples
+         over HTTPS does. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- minSdk 21 is what the built library requires: the
+         rustel-android-host cdylib links against the NDK's API-21
+         libraries (see docs/building.md). -->
+    <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="34" />
+
+    <application android:label="@string/app_name"
+        android:theme="@style/AppTheme"
+        android:debuggable="true">
+
+        <activity android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

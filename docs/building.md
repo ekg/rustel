@@ -180,6 +180,12 @@ link; no Android device was attached at the time of writing):
   compiles for Android, but the same JNI requirement applies, and input
   is untested on hardware.
 
+The `android/` directory holds the app that embeds the engine today: a
+minimal single-activity APK that evaluates a score and renders it to WAV
+through `rustel-android-host`, built without Gradle by
+`android/build-apk.sh`. See [the app's README](../android/README.md) for
+the build steps and the device requirements.
+
 Visuals need no separate system graphics library. Procedural and camera
 visuals need no network, while `initImage()`
 fetches the public HTTPS image named by the score. Check your build with

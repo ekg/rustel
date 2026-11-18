@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- A plain platform theme: the app carries no AndroidX dependency,
+         so it builds with javac and d8 alone (see build-apk.sh). -->
+    <style name="AppTheme" parent="@android:style/Theme.Material.Light">
+    </style>
+</resources>

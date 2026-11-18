@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Rustel</string>
+    <string name="score_hint">Strudel score</string>
+    <string name="evaluate">Evaluate</string>
+    <string name="render_and_play">Render &amp; Play</string>
+    <string name="stop">Stop</string>
+    <string name="status_idle">Ready.</string>
+    <string name="diagnostics_idle">Diagnostics appear here after Evaluate.</string>
+</resources>
