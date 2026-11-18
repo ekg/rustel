@@ -45,8 +45,8 @@ public final class RustelHost {
                                             String outDir);
 
     /**
-     * Stops the transport immediately; cancels a render in progress. Only
-     * call it when no other call on the handle is running.
+     * Stops the transport; the next render starts it again. Only call it
+     * when no other call on the handle is running.
      */
     public static native void stop(long handle);
 

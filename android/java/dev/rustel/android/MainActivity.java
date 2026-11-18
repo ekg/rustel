@@ -47,9 +47,10 @@ public final class MainActivity extends Activity {
     /** Every native call runs here, one at a time (see the class doc). */
     private final ExecutorService engine = Executors.newSingleThreadExecutor();
 
-    /** The native session handle, 0 until opened. Written on the engine
-     * thread, read on the UI thread in onDestroy, hence volatile. */
-    private volatile long handle;
+    /** The native session handle, 0 until opened. Only the engine thread
+     * touches it: {@link #handle()} opens it, every job runs on it, and
+     * the dispose task queued by onDestroy reads it last. */
+    private long handle;
 
     /**
      * The WAV a job wants played once it completes. Set on the engine
@@ -239,11 +240,17 @@ public final class MainActivity extends Activity {
         super.onDestroy();
         stopPlayback();
         // Queued behind any call still running, so the handle stays
-        // single-threaded to the end. shutdown() lets queued work finish.
-        long live = handle;
-        if (live != 0) {
-            engine.execute(() -> RustelHost.dispose(live));
-        }
+        // single-threaded to the end. The read runs inside the queued task
+        // because a first job still in flight has not set the handle yet;
+        // read on the UI thread it could miss the session that job is about
+        // to open, and that session would leak. shutdown() lets the queued
+        // work finish.
+        engine.execute(() -> {
+            long live = handle;
+            if (live != 0) {
+                RustelHost.dispose(live);
+            }
+        });
         engine.shutdown();
     }
 }

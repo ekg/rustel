@@ -1,7 +1,7 @@
 //! JNI exports of [`AndroidHost`] for the Android app. Compiled only for
 //! `target_os = "android"`; every other target builds the core alone.
 //!
-//! The Java-side contract, which the app's Kotlin declares as:
+//! The Java-side contract, which the app's Java declares as:
 //!
 //! ```java
 //! package dev.rustel.android;
@@ -19,7 +19,7 @@
 //!         `outDir/rustel-render.wav`. */
 //!     public static native byte[] renderToWav(long handle, double durationSecs,
 //!                                              String outDir);
-//!     /** Stops the transport immediately; cancels a render in progress. */
+//!     /** Stops the transport; the next render starts it again. */
 //!     public static native void stop(long handle);
 //!     /** Drains pending diagnostics as a JSON array string. */
 //!     public static native String diagnosticsJson(long handle);
@@ -133,12 +133,13 @@ pub extern "system" fn Java_dev_rustel_android_RustelHost_renderToWav<'local>(
     let out_dir = if out_dir.as_raw().is_null() {
         None
     } else {
-        rust_string(&mut env, out_dir, "output directory").map(PathBuf::from)
+        match rust_string(&mut env, out_dir, "output directory") {
+            Some(text) => Some(PathBuf::from(text)),
+            // The string read already threw; answer nothing.
+            None => return std::ptr::null_mut(),
+        }
     };
-    let Some(out_dir) = out_dir else {
-        return std::ptr::null_mut();
-    };
-    match host.render_to_wav(duration_secs, Some(out_dir.as_path())) {
+    match host.render_to_wav(duration_secs, out_dir.as_deref()) {
         Ok(wav) => match env.byte_array_from_slice(&wav) {
             Ok(array) => array.into_raw(),
             Err(_) => {

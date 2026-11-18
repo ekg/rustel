@@ -52,7 +52,7 @@ The script:
 
 1. runs `cargo ndk` for every ABI, through the dash-spelled
    `BINDGEN_EXTRA_CLANG_ARGS_<triple>` wrapper the bindgen build needs (see
-   `docs/building.md` and the probe report referenced there),
+   the Android cross-build section of `docs/building.md`),
 2. compiles and links the resources and the manifest with `aapt2`,
 3. compiles the Java sources with `javac --release 8` against
    `platforms/android-34/android.jar` and dexes them with `d8 --min-api 21`,

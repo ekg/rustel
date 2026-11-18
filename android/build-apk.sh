@@ -65,7 +65,7 @@ fi
 #    would then derive an unversioned triple that bionic's sys/cdefs.h
 #    rejects. The dash-spelled variable wins over it, so each target gets its
 #    own with the versioned triple and the NDK sysroot
-#    (see /home/erik/android-probe.md and docs/building.md).
+#    (see the Android cross-build section of docs/building.md).
 echo "== cargo ndk: rustel-android-host ($PROFILE) =="
 for abi in "${ABIS[@]}"; do
     echo "-- building $abi"

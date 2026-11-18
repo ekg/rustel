@@ -156,10 +156,10 @@ link; no Android device was attached at the time of writing):
   stream, and device enumeration goes through JNI the same way; both call
   `ndk_context::android_context()`, which panics in a process that has
   not initialized it. A bare `adb shell` or Termux binary therefore
-  cannot open live output. The supported route is an app that embeds
-  Rustel through the `rustel-android-host` crate and calls
-  `ndk_context::initialize_android_context` with its JavaVM and Activity
-  context before playback.
+  cannot open live output. Live output needs a host that initializes
+  ndk-context with the app's JavaVM and Activity context before
+  playback; `rustel-android-host` does not provide this hook yet, and
+  the app under `android/` renders offline.
 - Without a JNI device listing, CPAL falls back to a single unnamed
   default device, so `--output` with a device name has nothing to match.
 - The callback runs with the platform's ordinary scheduling. No plugin
