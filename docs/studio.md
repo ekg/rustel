@@ -684,11 +684,13 @@ a `slider(value, min, max, step)`, the rail moves its value argument and
 keeps the call, and the change sounds at once. The score is the master. The
 column only edits what is written.
 
-The number of an audio control, such as the `4000` of `lpf(4000)`, also
-sounds at once while the set plays, with no update and with auto evaluate
-on or off. The first move installs the playing score again, unchanged, with
+A plain number that the engine reads as a pattern also sounds at once while
+the set plays, with no update and with auto evaluate on or off. That is the
+number of an audio control, such as the `4000` of `lpf(4000)`, and each
+number of a function such as `pg(0.8)`, `fast(2)` or `seg(4)`. The first move installs the playing score again, unchanged, with
 that number live. Edits you have not evaluated stay out of the sound. After
-that each move sets the number, as a slider does. Any other number sounds at
+that each move sets the number, as a slider does. A number in an options
+object, of a plugin call or of a function defined in the score sounds at
 once while the set plays and auto evaluate is on, with the next update. A
 stopped set, or auto evaluate off, keeps the typing pause.
 

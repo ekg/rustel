@@ -9,11 +9,41 @@
 //! does. The numbers stay live through the updates that follow, while the
 //! score still holds them.
 
+use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::LazyLock;
 
 use rustel_transpiler::{live_number_id, live_number_range};
 
 use super::*;
+
+/// Whether a call reads its argument at `at` as a pattern, so a live cell
+/// can stand in for a number there: an audio control's value, such as the
+/// `4000` of `lpf(4000)`, or an argument of a function the engine
+/// patternifies, such as `seg(4)` or `pg(0.8)`. A function that takes its
+/// numbers as they are, and a function defined in the score, keep the
+/// number as written.
+pub(super) fn takes_a_live_number(callee: &str, control: bool, at: usize) -> bool {
+    /// Each patternified function's name and how many arguments it
+    /// patternifies: all but the pattern it is applied to.
+    static PATTERNIFIED: LazyLock<HashMap<String, usize>> = LazyLock::new(|| {
+        #[cfg(feature = "extensions")]
+        let registry = rustel_ext::default_registry();
+        #[cfg(not(feature = "extensions"))]
+        let registry = rustel_core::register::default_registry();
+        registry
+            .names()
+            .into_iter()
+            .filter_map(|name| {
+                let registration = registry.get(name)?;
+                registration
+                    .patternify
+                    .then(|| (name.to_owned(), registration.arity.saturating_sub(1)))
+            })
+            .collect()
+    });
+    (control && at == 0) || PATTERNIFIED.get(callee).is_some_and(|count| at < *count)
+}
 
 /// A scene's live numbers, pinned to the text revision they were placed in
 /// and mapped forward from it at the point of use, as [`LiveSliderSet`] is.
@@ -294,8 +324,11 @@ mod tests {
     /// The score the set plays, installed, with an edit typed since that
     /// nobody evaluated: `seg(4)` became `seg(16)`. The caret is on the
     /// cutoff and the knobs column is open on it.
-    fn playing_with_an_unevaluated_edit(directory: &std::path::Path) -> (App, &'static str) {
-        let source = "$: s(\"sine\").seg(4).lpf(4000)\n";
+    fn playing_with_an_unevaluated_edit(
+        directory: &std::path::Path,
+        source: &'static str,
+        number: &str,
+    ) -> App {
         let (mut app, scene, _) = build_app(directory, source, None);
         app.evaluation_revisions.remember(
             source_revision(source),
@@ -319,13 +352,15 @@ mod tests {
                 &mut MemoryClipboard::default(),
             )
             .expect("the unevaluated edit");
-        let caret = app.editor().source().find("4000").expect("the cutoff");
+        let caret = app.editor().source().find(number).expect("the number");
         app.editor_mut()
             .set_selection(Selection::caret(ByteOffset(caret)))
-            .expect("the caret on the cutoff");
+            .expect("the caret on the number");
         app.open_knobs_panel(true);
-        (app, source)
+        app
     }
+
+    const CUTOFF: &str = "$: s(\"sine\").seg(4).lpf(4000)\n";
 
     /// The texts sent to the engine since the test began, newest last.
     fn sent(app: &App) -> Vec<Arc<str>> {
@@ -344,7 +379,8 @@ mod tests {
     #[test]
     fn a_rail_moves_the_playing_score_and_leaves_an_unevaluated_edit_alone() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let (mut app, installed) = playing_with_an_unevaluated_edit(directory.path());
+        let installed = CUTOFF;
+        let mut app = playing_with_an_unevaluated_edit(directory.path(), installed, "4000");
         app.ui_settings.auto_evaluate = true;
         let rail = Rect::new(0, 0, 24, 1);
 
@@ -408,12 +444,53 @@ mod tests {
         assert!(app.editor().source().contains("seg(16)"));
     }
 
+    /// A function the engine patternifies takes a live number as a control
+    /// does: `pg(0.8)` moves live. A function that takes its number as it is
+    /// keeps the write in the score.
+    #[test]
+    fn a_patternified_function_moves_live_and_a_plain_one_does_not() {
+        for (source, number, live) in [
+            ("$: s(\"sine\").seg(4).pg(0.8)\n", "0.8", true),
+            ("$: s(\"sine\").seg(4).ply(3)\n", "3", true),
+            ("$: s(\"sine\").seg(4).midi(\"out\", 3)\n", "3", false),
+        ] {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let mut app = playing_with_an_unevaluated_edit(directory.path(), source, number);
+            app.refresh_knobs(Rect::default());
+            let at = app
+                .knobs_rows
+                .as_ref()
+                .and_then(|rows| rows.knobs.iter().position(|knob| knob.state.is_some()));
+            let Some(at) = at else {
+                assert!(!live, "{source} has a rail");
+                continue;
+            };
+            app.drag_knob(at, Rect::new(0, 0, 24, 1), 20);
+            assert_ne!(app.editor().source(), source, "{source}: the rail wrote");
+            assert_eq!(!sent(&app).is_empty(), live, "{source}");
+        }
+    }
+
+    #[test]
+    fn which_calls_take_a_live_number() {
+        assert!(takes_a_live_number("lpf", true, 0));
+        assert!(!takes_a_live_number("lpf", true, 1));
+        assert!(takes_a_live_number("pg", false, 0));
+        assert!(takes_a_live_number("euclid", false, 1));
+        assert!(
+            !takes_a_live_number("euclid", false, 2),
+            "the pattern itself"
+        );
+        assert!(!takes_a_live_number("midi", false, 0));
+        assert!(!takes_a_live_number("myOwnFunction", false, 0));
+    }
+
     /// A stopped set has no score to move: the rail writes the score, and
     /// nothing is installed.
     #[test]
     fn a_stopped_set_keeps_the_write_in_the_score() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let (mut app, _) = playing_with_an_unevaluated_edit(directory.path());
+        let mut app = playing_with_an_unevaluated_edit(directory.path(), CUTOFF, "4000");
         app.snapshot = Some(sounding(false, false));
         app.drag_knob(0, Rect::new(0, 0, 24, 1), 4);
         assert!(!app.editor().source().contains("4000"));

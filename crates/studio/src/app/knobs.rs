@@ -2237,7 +2237,7 @@ impl App {
         if unchanged {
             return true;
         }
-        if self.knob_is_a_control_value(knob)
+        if self.knob_takes_a_live_number(knob)
             && self.move_live_number(literal.clone(), value, &text)
         {
             return true;
@@ -2245,20 +2245,25 @@ impl App {
         self.knobs_write(literal, &text)
     }
 
-    /// Whether a rail is the number an audio control is given - the `4000`
-    /// of `lpf(4000)` - which a live cell can stand in for. An entry of an
-    /// options object is read as it is written, so a cell there would not
-    /// be a number.
-    fn knob_is_a_control_value(&self, knob: &Knob) -> bool {
+    /// Whether a live cell can stand in for a rail's plain number: see
+    /// [`super::live_numbers::takes_a_live_number`]. An entry of an options
+    /// object is read as it is written, so a cell there would not be a
+    /// number.
+    fn knob_takes_a_live_number(&self, knob: &Knob) -> bool {
+        let KnobPlace::Argument(at) = knob.place else {
+            return false;
+        };
         knob.state
             .as_ref()
             .is_some_and(|state| state.fader.is_none())
-            && knob.place == KnobPlace::Argument(0)
             && self
                 .knobs_parse
                 .as_ref()
                 .and_then(|parse| parse.call.as_ref())
-                .is_some_and(|call| call.control)
+                .is_some_and(|call| {
+                    call.plugin.is_none()
+                        && super::live_numbers::takes_a_live_number(&call.name, call.control, at)
+                })
     }
 
     /// A rail's value as the score writes it: a plugin parameter to three
