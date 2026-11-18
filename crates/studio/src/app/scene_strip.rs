@@ -179,7 +179,7 @@ impl App {
         self.select_scene(index);
         self.evaluate_with(LaunchRequest {
             launch,
-            rewind: false,
+            ..LaunchRequest::default()
         })
     }
 

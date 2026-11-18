@@ -221,6 +221,7 @@ impl App {
                 self.rebuild_slider_spans();
                 self.lint.remove(&id);
                 self.live_sliders.remove(&id);
+                self.live_numbers.remove(&id);
                 self.readiness.remove(&id);
                 self.invalidate_maps();
                 self.status = format!(

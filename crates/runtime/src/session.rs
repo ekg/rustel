@@ -9,6 +9,7 @@
 mod assets;
 mod diagnostics;
 mod installation;
+mod live_numbers;
 mod output;
 mod query;
 mod scheduling;
@@ -813,6 +814,8 @@ pub struct Session {
     transport: Arc<Transport>,
     scheduler: Scheduler,
     config: SessionConfig,
+    /// The numbers each score text makes live: see `set_live_numbers`.
+    live_numbers: live_numbers::LiveNumbers,
     last_source: Option<Arc<str>>,
     /// The score of this session plays through the plugins of a live
     /// output: see [`Self::attach_plugins`].
@@ -1198,6 +1201,7 @@ impl Session {
             transport,
             scheduler,
             config,
+            live_numbers: live_numbers::LiveNumbers::default(),
             last_source: None,
             #[cfg(feature = "vst")]
             plugins_live: AtomicBool::new(false),

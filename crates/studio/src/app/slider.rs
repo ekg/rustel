@@ -128,7 +128,8 @@ fn decimal_value(value: f64, decimals: usize) -> f64 {
 impl App {
     /// Place the audible generation's sliders in its own text.
     pub(super) fn rebuild_slider_spans(&mut self) {
-        let previous = std::mem::take(&mut self.sliders);
+        let mut previous = std::mem::take(&mut self.sliders);
+        previous.extend(self.live_number_spans());
         self.sliders_revision = None;
         let Some(revision) = self.visual_revision else {
             return;
@@ -689,48 +690,8 @@ impl App {
             set.revision = after;
         }
 
-        // The engine's own copy, when the running score has this control:
-        // the audible spans are kept in step and the new value is handed to
-        // the pattern.
-        let audible_id = (Some(scene_id) == self.audible_scene)
-            .then(|| {
-                self.sliders
-                    .iter()
-                    .position(|span| span.from < to && from < span.to)
-            })
-            .flatten();
-        if let Some(index) = audible_id {
-            // The id and the evaluated bounds, taken before the rebuild can
-            // shift indices by dropping unmappable neighbours.
-            let id = self.sliders[index].id.clone();
-            // The engine's control keeps its EVALUATED bounds until the next
-            // update; a text whose bounds were edited since can name values
-            // the engine would refuse, once per mouse-move. Clamp what is
-            // sent; the text keeps what was written.
-            let engine_value = self.sliders[index].clamp(value);
-            let mut kept = Vec::with_capacity(self.sliders.len());
-            for (position, span) in self.sliders.drain(..).enumerate() {
-                if position == index {
-                    kept.push(SliderSpan {
-                        from,
-                        to: from + text.len(),
-                        value,
-                        ..span
-                    });
-                } else if let Some(range) = editor.map_range_since(before, span.from..span.to) {
-                    kept.push(SliderSpan {
-                        from: range.start,
-                        to: range.end,
-                        ..span
-                    });
-                }
-            }
-            self.sliders = kept;
-            self.sliders_revision = Some(after);
-            self.owe_slider(id, engine_value, smooth);
-            self.slider_tape_due = Some(Instant::now() + TAPE_GESTURE_SETTLE);
-            self.flush_pending_sliders();
-        }
+        // The engine's own copy, when the running score has this control.
+        self.hand_written_value(scene_id, before, from..to, text.len(), value, smooth);
         self.status = if self.armed_slider == Some((scene_id, chip.call.start)) {
             self.slider_hint(value, chip.span.step, chip.travel)
         } else {
@@ -744,9 +705,73 @@ impl App {
         self.dirty_frame = true;
     }
 
+    /// Hand a value just written into the score to the running score's
+    /// control over `literal` - the value's range at `before`, the revision
+    /// the write applied on - and keep the audible spans in step: the
+    /// written control at the `written` bytes that replaced its value, every
+    /// other control mapped through the write. Returns whether the running
+    /// score has the control. One the engine has never seen keeps the write
+    /// in the text alone, and sounds on the next update like any other edit.
+    pub(super) fn hand_written_value(
+        &mut self,
+        scene_id: SceneId,
+        before: Revision,
+        literal: std::ops::Range<usize>,
+        written: usize,
+        value: f64,
+        smooth: bool,
+    ) -> bool {
+        let (from, to) = (literal.start, literal.end);
+        let audible_id = (Some(scene_id) == self.audible_scene)
+            .then(|| {
+                self.sliders
+                    .iter()
+                    .position(|span| span.from < to && from < span.to)
+            })
+            .flatten();
+        let Some(index) = audible_id else {
+            return false;
+        };
+        let Some(editor) = self.scenes.get(scene_id).map(|scene| &scene.editor) else {
+            return false;
+        };
+        let after = editor.revision();
+        // The id and the evaluated bounds, taken before the rebuild can
+        // shift indices by dropping unmappable neighbours.
+        let id = self.sliders[index].id.clone();
+        // The engine's control keeps its EVALUATED bounds until the next
+        // update; a text whose bounds were edited since can name values
+        // the engine would refuse, once per mouse-move. Clamp what is
+        // sent; the text keeps what was written.
+        let engine_value = self.sliders[index].clamp(value);
+        let mut kept = Vec::with_capacity(self.sliders.len());
+        for (position, span) in self.sliders.drain(..).enumerate() {
+            if position == index {
+                kept.push(SliderSpan {
+                    from,
+                    to: from + written,
+                    value,
+                    ..span
+                });
+            } else if let Some(range) = editor.map_range_since(before, span.from..span.to) {
+                kept.push(SliderSpan {
+                    from: range.start,
+                    to: range.end,
+                    ..span
+                });
+            }
+        }
+        self.sliders = kept;
+        self.sliders_revision = Some(after);
+        self.owe_slider(id, engine_value, smooth);
+        self.slider_tape_due = Some(Instant::now() + TAPE_GESTURE_SETTLE);
+        self.flush_pending_sliders();
+        true
+    }
+
     /// Owe the engine this slider's newest value. A newer move of the same
     /// slider replaces the older one, and every other slider keeps its own.
-    fn owe_slider(&mut self, id: String, value: f64, smooth: bool) {
+    pub(super) fn owe_slider(&mut self, id: String, value: f64, smooth: bool) {
         match self
             .pending_sliders
             .iter_mut()

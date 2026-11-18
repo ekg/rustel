@@ -34,12 +34,14 @@ use std::path::Path;
 mod arrange_marks;
 mod callback_ir;
 mod frequency_sliders;
+mod live_numbers;
 mod surface_writes;
 pub use callback_ir::{
     CallbackArgument, CallbackMethodCall, MAX_CALLBACK_IR_SOURCE_BYTES, PatternTransformCandidate,
     PatternTransformFallbackReason, lower_pattern_transform_callback,
 };
 pub use frequency_sliders::is_frequency_control;
+pub use live_numbers::{LIVE_NUMBER_WIDGET, live_number_id, live_number_range};
 pub use surface_writes::{SurfaceWrites, surface_writes};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1000,6 +1002,12 @@ pub struct TranspileOptions {
     /// [`TranspileOutput::lanes_by_place`]. A label with no code is no
     /// lane, here and in the rewrite.
     pub lane_numbers: Vec<u64>,
+    /// Numeric literals a host moves while the score plays, as byte ranges
+    /// of the source. Each one that stands alone as a value reads a live
+    /// cell, as a `slider(…)` does, and gets a [`LIVE_NUMBER_WIDGET`]
+    /// record whose id is [`live_number_id`]. The host sets the cell by
+    /// that id without a new evaluation. Any other range is ignored.
+    pub live_numbers: Vec<std::ops::Range<usize>>,
 }
 
 impl Default for TranspileOptions {
@@ -1016,6 +1024,7 @@ impl Default for TranspileOptions {
             allow_module_syntax: true,
             loaded_imports: Vec::new(),
             lane_numbers: Vec::new(),
+            live_numbers: Vec::new(),
         }
     }
 }
@@ -2544,6 +2553,32 @@ fn transpile_here(source: &str, options: &TranspileOptions) -> TranspileOutput {
             visual_slot = visual_slot.saturating_add(1);
         }
     }
+    // Live numbers come after the slots and the slider labels: a number
+    // is neither, and a recorded call keeps the numbers inside it.
+    let taken: Vec<_> = widgets
+        .iter()
+        .zip(&sites)
+        .filter(|(_, site)| !matches!(site, CallSite::AsWritten))
+        .map(|(widget, _)| {
+            widget.call_from - options.block_offset..widget.call_to - options.block_offset
+        })
+        .chain(
+            kabelsalat
+                .iter()
+                .map(|call| call.name..call.stringified().end),
+        )
+        .collect();
+    let (live, live_sites): (Vec<_>, Vec<_>) = live_numbers::collect(
+        source,
+        &options.live_numbers,
+        options.block_offset,
+        &regexes,
+        &taken,
+    )
+    .into_iter()
+    .unzip();
+    widgets.extend(live);
+    let sites: Vec<_> = sites.into_iter().chain(live_sites).collect();
     let MiniRewrite {
         output: mini,
         locations: mini_locations,
@@ -2555,8 +2590,9 @@ fn transpile_here(source: &str, options: &TranspileOptions) -> TranspileOutput {
     let mut splices = widget_splices(&mini, &mini_map, &widgets, &sites);
     if options.emit_mini_locations {
         splices.extend(arrange_marks::splices(source, options.block_offset));
-        splices.sort_by_key(|&(at, _)| at);
     }
+    // Stable: two splices at one place keep the order they were made in.
+    splices.sort_by_key(|&(at, _)| at);
     let widget_source = splice(&mini, &mini_map, &splices);
     let kabel = rewrite_kabelsalat(&widget_source, regexes_are_present);
     let (labels, lanes_by_place) =
@@ -3351,6 +3387,9 @@ enum CallSite {
     Method { open: usize },
     /// `all(<painter>)`: layout metadata; the call is not rewritten.
     AsWritten,
+    /// A live number: `sliderWithID('<id>', ` before the literal at `start`
+    /// and `)` after it at `end`.
+    Number { start: usize, end: usize },
 }
 
 /// The widget calls in `source` with their splice sites, in source order.
@@ -3694,6 +3733,14 @@ fn widget_splices(
     for (record, site) in records.iter().zip(sites) {
         let open = match *site {
             CallSite::AsWritten => continue,
+            CallSite::Number { start, end } => {
+                splices.push((
+                    start,
+                    format!("sliderWithID({}, ", quote_single(&record.id)),
+                ));
+                splices.push((end, ")".to_string()));
+                continue;
+            }
             CallSite::Slider { name_end, open } => {
                 splices.push((name_end, "WithID".to_string()));
                 open

@@ -211,6 +211,7 @@ impl App {
                 self.rebuild_slider_spans();
                 self.lint.remove(&id);
                 self.live_sliders.remove(&id);
+                self.live_numbers.remove(&id);
                 self.readiness.remove(&id);
                 self.closed_documents.push(id.0);
                 self.invalidate_maps();
@@ -413,6 +414,7 @@ impl App {
                 .then_some(revision);
         }
         self.live_sliders.remove(&id);
+        self.live_numbers.remove(&id);
         if self.audible_scene == Some(id) {
             self.visual_revision = (self.visual_replay_block.as_ref() == Some(&block)
                 && self.evaluated_source.as_deref() == Some(source.as_str()))

@@ -148,6 +148,9 @@ pub(super) struct LaunchRequest {
     pub(super) launch: Launch,
     /// The score starts from its own cycle zero.
     pub(super) rewind: bool,
+    /// The install sounds as the score playing does, so it lands at once:
+    /// no launch line is waited for, whatever the launch setting says.
+    pub(super) in_place: bool,
 }
 
 impl Default for LaunchRequest {
@@ -156,6 +159,7 @@ impl Default for LaunchRequest {
         Self {
             launch: Launch::Now,
             rewind: false,
+            in_place: false,
         }
     }
 }
@@ -550,6 +554,7 @@ impl App {
         let auditioning = false;
         if !replaying
             && !auditioning
+            && !request.in_place
             && matches!(launch, Launch::Now)
             && self.is_playing()
             && !self.is_stopping()
@@ -582,6 +587,7 @@ impl App {
             replay_block,
         );
         self.bind_live_sliders(scene, revision, &source);
+        self.send_live_numbers(scene, revision, &source);
         // From zero, or joining the cycle already running.
         //
         // A replay is on its own clock and is not rewound here. What is
@@ -850,6 +856,7 @@ impl App {
                     }
                 }
                 self.rebuild_slider_spans();
+                self.sync_live_numbers();
                 self.invalidate_maps();
                 self.dirty_frame = true;
             }

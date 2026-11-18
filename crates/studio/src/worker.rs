@@ -175,6 +175,12 @@ enum EngineCommand {
     },
     /// The mixer: the audio input's fader, linear.
     SetInputGain(f32),
+    /// The numbers of a score text that its evaluations make live. Sent
+    /// before the text's `Evaluate`, which reads them.
+    SetLiveNumbers {
+        source: Arc<str>,
+        ranges: Vec<std::ops::Range<usize>>,
+    },
     /// Move one of the running score's sliders without re-evaluating.
     SetSlider {
         id: String,
@@ -645,6 +651,22 @@ impl StudioWorker {
             && self
                 .commands
                 .try_send(EngineCommand::SetOutput(name.to_owned()))
+                .is_ok()
+    }
+
+    /// Name the numbers of `source` that its evaluations make live: see
+    /// [`rustel_runtime::Session::set_live_numbers`]. False when the
+    /// command queue is full; the app sends it again with the evaluation it
+    /// goes before.
+    pub fn try_set_live_numbers(
+        &self,
+        source: Arc<str>,
+        ranges: Vec<std::ops::Range<usize>>,
+    ) -> bool {
+        !self.shutdown_requested.load(Ordering::Acquire)
+            && self
+                .commands
+                .try_send(EngineCommand::SetLiveNumbers { source, ranges })
                 .is_ok()
     }
 
@@ -1643,6 +1665,10 @@ fn process_command(
                 armed,
                 pending,
             );
+            false
+        }
+        EngineCommand::SetLiveNumbers { source, ranges } => {
+            engine.set_live_numbers(&source, ranges);
             false
         }
         EngineCommand::SetSlider { id, value, smooth } => {

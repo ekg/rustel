@@ -2206,8 +2206,9 @@ impl App {
 
     /// Set a rail's value: through the live control when the score holds
     /// a fader there - the engine hears it without a re-evaluation - or
-    /// as one control edit of the text, which the next update or auto
-    /// evaluate picks up.
+    /// through a live number when the rail is a control's own number and
+    /// the set plays, or else as one control edit of the text, which the
+    /// next update or auto evaluate picks up.
     fn set_knob(&mut self, knob: &Knob, value: f64) -> bool {
         let scene = self.scenes.current().id;
         let value = value.clamp(knob.min, knob.max);
@@ -2236,7 +2237,28 @@ impl App {
         if unchanged {
             return true;
         }
+        if self.knob_is_a_control_value(knob)
+            && self.move_live_number(literal.clone(), value, &text)
+        {
+            return true;
+        }
         self.knobs_write(literal, &text)
+    }
+
+    /// Whether a rail is the number an audio control is given - the `4000`
+    /// of `lpf(4000)` - which a live cell can stand in for. An entry of an
+    /// options object is read as it is written, so a cell there would not
+    /// be a number.
+    fn knob_is_a_control_value(&self, knob: &Knob) -> bool {
+        knob.state
+            .as_ref()
+            .is_some_and(|state| state.fader.is_none())
+            && knob.place == KnobPlace::Argument(0)
+            && self
+                .knobs_parse
+                .as_ref()
+                .and_then(|parse| parse.call.as_ref())
+                .is_some_and(|call| call.control)
     }
 
     /// A rail's value as the score writes it: a plugin parameter to three
@@ -2504,11 +2526,21 @@ impl App {
     /// [`Self::knobs_write`] for edits that land together: ranges of the
     /// score as it stands, none overlapping, as one undo step.
     fn knobs_edit(&mut self, edits: Vec<(Range<usize>, String)>) -> bool {
+        if self.control_edit(edits).is_none() {
+            return false;
+        }
+        self.auto_evaluate_due = false;
+        self.auto_evaluate();
+        true
+    }
+
+    /// The panel's edits as one control edit of the current score, with
+    /// none of the update an edit owes: the revision they applied on, or
+    /// `None` when the editor refused them.
+    pub(super) fn control_edit(&mut self, edits: Vec<(Range<usize>, String)>) -> Option<Revision> {
         let scene = self.scenes.current().id;
         let moment = self.moment();
-        let Some(entry) = self.scenes.get_mut(scene) else {
-            return false;
-        };
+        let entry = self.scenes.get_mut(scene)?;
         let viewport = entry.editor.viewport();
         let before = entry.editor.revision();
         let transaction = edits.into_iter().fold(
@@ -2527,15 +2559,13 @@ impl App {
             }
             Err(error) => {
                 self.set_error(ErrorOwner::Editor, error.to_string());
-                return false;
+                return None;
             }
         }
         self.after_edit(scene, before, false);
-        self.auto_evaluate_due = false;
-        self.auto_evaluate();
         self.knobs_parse = None;
         self.dirty_frame = true;
-        true
+        Some(before)
     }
 
     /// A press on the panel: a rail sets its value where it is clicked,
@@ -2788,6 +2818,7 @@ fn forget_param(chosen: &mut Vec<String>, key: &str) {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     #[test]

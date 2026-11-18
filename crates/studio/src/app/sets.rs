@@ -1633,6 +1633,7 @@ impl App {
         self.lint.clear();
         self.evaluation_alerts.clear();
         self.live_sliders.clear();
+        self.live_numbers.clear();
         self.readiness.clear();
         self.tabs_closed += 1;
         // A setup tab plays no score, so it has no document to close.

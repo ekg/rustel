@@ -717,6 +717,7 @@ impl Session {
             // so a plugin note names the same lane after an edit.
             #[cfg(feature = "vst")]
             lane_numbers: self.lanes.read(source),
+            live_numbers: self.live_numbers(source).to_vec(),
             ..TranspileOptions::default()
         };
         let evaluated = match seed {

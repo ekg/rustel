@@ -661,7 +661,11 @@ impl App {
             // is the set's and is not touched.
             rewind = !generator || !replacing || !playing;
         }
-        self.next_evaluation = LaunchRequest { launch, rewind };
+        self.next_evaluation = LaunchRequest {
+            launch,
+            rewind,
+            ..LaunchRequest::default()
+        };
         self.queue_evaluation_for(scene, revision, source, false);
         self.status = if alone {
             "previewing the snippet".into()

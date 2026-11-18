@@ -8,7 +8,8 @@
 
 use rustel_scheduler::{ScheduleTraceEvent, TraceSampleWalk};
 use rustel_transpiler::{
-    ALL_VISUAL_WIDGET_PREFIX, TranspileOptions, VISUAL_WIDGET_METHODS, transpile,
+    ALL_VISUAL_WIDGET_PREFIX, LIVE_NUMBER_WIDGET, TranspileOptions, VISUAL_WIDGET_METHODS,
+    transpile,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -491,6 +492,17 @@ pub fn visual_layout(
     source: &str,
     generation: u64,
 ) -> Result<UiLayoutEnvelope, UiLayoutValidationError> {
+    visual_layout_with_live_numbers(source, generation, &[])
+}
+
+/// [`visual_layout`] for a source evaluated with live numbers: each live
+/// number is a slider of the layout, with the full finite range, so a
+/// client moves it as it moves a slider.
+pub fn visual_layout_with_live_numbers(
+    source: &str,
+    generation: u64,
+    live_numbers: &[std::ops::Range<usize>],
+) -> Result<UiLayoutEnvelope, UiLayoutValidationError> {
     let output = transpile(
         source,
         &TranspileOptions {
@@ -501,6 +513,7 @@ pub fn visual_layout(
                 .collect(),
             id: Some("ui_layout".to_owned()),
             allow_module_syntax: false,
+            live_numbers: live_numbers.to_vec(),
             ..TranspileOptions::default()
         },
     );
@@ -547,19 +560,34 @@ pub fn visual_layout(
     let sliders = output
         .widgets
         .iter()
-        .filter(|widget| widget.widget_type == "slider")
         .filter_map(|widget| {
             let value = widget.value.as_deref()?.parse::<f64>().ok()?;
-            let min = widget.min?;
-            let max = widget.max?;
-            let slider = UiSlider {
-                id: widget.id.clone(),
-                from: widget.from,
-                to: widget.to,
-                value,
-                min,
-                max,
-                step: widget.step.unwrap_or((max - min) / 1000.0),
+            let slider = match widget.widget_type.as_str() {
+                "slider" => {
+                    let min = widget.min?;
+                    let max = widget.max?;
+                    UiSlider {
+                        id: widget.id.clone(),
+                        from: widget.from,
+                        to: widget.to,
+                        value,
+                        min,
+                        max,
+                        step: widget.step.unwrap_or((max - min) / 1000.0),
+                    }
+                }
+                // A live number has no bounds or step of its own: it takes
+                // any finite value its client gives it.
+                LIVE_NUMBER_WIDGET => UiSlider {
+                    id: widget.id.clone(),
+                    from: widget.from,
+                    to: widget.to,
+                    value,
+                    min: f64::MIN,
+                    max: f64::MAX,
+                    step: f64::MIN_POSITIVE,
+                },
+                _ => return None,
             };
             slider.validate(0).ok().map(|()| slider)
         })
