@@ -1917,11 +1917,17 @@ mod tests {
         fn callback_pressure_reports_semantic_fades_without_allocating() {
             let _tripwire_guard = tripwire_assertion_guard();
             let shared = LiveShared::new(1);
-            for onset_id in 0..130 {
+            // Seventy onsets, then sixty in the next block: the second block
+            // passes the cap while the first fills most of a block's
+            // activation budget.
+            for (onset_id, target_frame) in (0..130).map(|id| {
+                let frame = if id < 70 { 0 } else { 128 };
+                (id, frame)
+            }) {
                 assert!(shared.ring.push(AudioEvent {
                     onset_id,
                     generation: 1,
-                    target_frame: 0,
+                    target_frame,
                     onset_lead: 0.0,
                     freq_hz: 220.0,
                     gain: 0.1,

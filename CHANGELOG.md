@@ -8,6 +8,7 @@
 - A score made of patterns, controls, functions, arrows and lanes is evaluated without JavaScript, 15 to 60 times faster on a new session, and an edit builds only the calls it changed. The script engine starts only for a score that needs it: the memory breakdown and `rustel play` name the line that needs it.
 - A score evaluated again keeps the answers of what it did not change, and a restarted section is asked only where it plays: the first query after an edit of a large score runs up to 170 times faster, and the first query of a score in sections about 17 times faster.
 - A dense score edited while it plays keeps all its scheduled notes: a live window now enters the ring before the backlog cap drops anything, and only a genuinely full pipeline drops the newest events.
+- A score that asks for thousands of voices a second keeps its audio thread inside its deadline: retiring voices fade in proportion to the cull rate, one block starts at most one polyphony cap of voices, and a saturated intake refuses a note before ferrying it. The set thins out instead of crackling and dropping out; ordinary music keeps its full quarter-second fades.
 
 ## v0.1.7
 
