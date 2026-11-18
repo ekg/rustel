@@ -40,7 +40,8 @@ stays as it was.
 
 Use one editor for each score file. Studio does not merge external edits with
 unsaved edits. See [External changes](#external-changes) to follow saves from
-another program.
+another program, and [Pods](#pods) to hand the score to an external agent
+that rewrites it.
 
 ## Shortcuts
 
@@ -63,6 +64,7 @@ Use these alternatives if the terminal or operating system takes a shortcut.
 | Master volume | ^⇧↑ / ^⇧↓; Ctrl+F12 / Ctrl+F11 |
 | Slider under the caret | Alt+↑ / Alt+↓ |
 | Quick action at the caret | ^J |
+| Pod prompt | ^⇧J; learn another on Settings ▸ Keybinds where the terminal keeps it |
 | Knobs column | ^⇧K; View ▸ Knobs |
 | Zen mode | ^K or F11 |
 | Word wrap | ^U |
@@ -408,6 +410,47 @@ itself is ignored.
 
 A save from another program that changes the text replaces the open editor's
 text, including edits that are not saved yet. Studio does not merge the two.
+
+### Pods
+
+A pod is an external command that takes a prompt and rewrites score files:
+an AI agent CLI, a script of your own, anything at all. Configure it under
+Settings ▸ Live coding ▸ pod command as a template, press ^⇧J, type a
+prompt, and press Enter. Studio runs the command in the background with the
+set folder as its working directory; what the pod writes, the
+[external changes](#external-changes) watch follows - `sync` takes the saved
+text into the editor, and `sync & eval` opens the score's tab and plays it.
+
+The template is split on whitespace into the command's arguments; there is no
+shell, so nothing in it is quoted, escaped or expanded by anything else. Three
+placeholders are replaced first:
+
+| Placeholder | Replaced with |
+| --- | --- |
+| `{prompt}` | the prompt you typed |
+| `{set}` | the set folder the pod runs in |
+| `{file}` | the open score's path |
+
+A template with no `{prompt}` gets the prompt appended as its final argument,
+so a bare program name is a complete configuration. For example:
+
+```text
+my-agent --prompt {prompt} --file {file}
+```
+
+The pod's stdout and stderr arrive line by line in the Log under `pod`, kept
+to a bounded tail (the last 200 lines and 64 KB). A running pod is a row in
+the jobs sheet and the header's chip; the footer says when it finished or
+failed. At most one pod runs at a time - a prompt submitted while one runs
+is refused, because two of them writing one file is a race nobody asked for.
+There is no cancellation for the same reason: killing a pod mid-write leaves
+a half-written score. The pod runs unattended, with its input closed, so
+configure it for non-interactive use. An empty pod command hides the feature:
+the prompt answers with where to set one.
+
+A terminal that cannot tell ^⇧J from ^J, or keeps ^⇧J for itself, leaves the
+pod prompt without a chord; learn one on Settings ▸ Keybinds, the way the
+knobs column's chord is learnt there.
 
 ### Sync with score metadata
 

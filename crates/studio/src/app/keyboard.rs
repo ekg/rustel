@@ -647,6 +647,12 @@ impl App {
         if self.quit_key(&terminal_event) {
             return Ok(());
         }
+        // The pod prompt owns the keys next, ahead of the panels: it can
+        // open over the settings sheet, and a prompt opened from the
+        // sheet is the exception to the sheet holding the keyboard.
+        if self.pod_prompt_event(&terminal_event) {
+            return Ok(());
+        }
         #[cfg(feature = "remote-control")]
         if self.remote_panel_event(&terminal_event) {
             return Ok(());
@@ -704,9 +710,6 @@ impl App {
             return Ok(());
         }
         if self.smart_action_event(&terminal_event) {
-            return Ok(());
-        }
-        if self.pod_prompt_event(&terminal_event) {
             return Ok(());
         }
         if self.precision_slider_event(&terminal_event) {

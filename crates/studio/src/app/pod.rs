@@ -28,7 +28,6 @@
 use super::*;
 use ratatui::style::Style;
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
-use std::io::BufRead;
 use std::path::Path;
 use std::process::{Child, Stdio};
 
@@ -138,10 +137,7 @@ pub(super) fn pod_arguments(
             argument
                 .replace("{prompt}", prompt)
                 .replace("{set}", &set.display().to_string())
-                .replace(
-                    "{file}",
-                    file.as_deref().unwrap_or_default(),
-                )
+                .replace("{file}", file.as_deref().unwrap_or_default())
         })
         .collect();
     if !template.contains("{prompt}") {
@@ -222,12 +218,7 @@ pub(super) fn render_prompt(frame: &mut ratatui::Frame<'_>, theme: &Theme, promp
             .style(Style::default().bg(theme.overlay).fg(theme.foreground)),
         area,
     );
-    let inner = Rect::new(
-        area.x + 1,
-        area.y + 1,
-        area.width.saturating_sub(2),
-        1,
-    );
+    let inner = Rect::new(area.x + 1, area.y + 1, area.width.saturating_sub(2), 1);
     let (text, caret) = prompt.window(usize::from(inner.width));
     frame.render_widget(
         Paragraph::new(text).style(Style::default().fg(theme.foreground)),
@@ -237,55 +228,81 @@ pub(super) fn render_prompt(frame: &mut ratatui::Frame<'_>, theme: &Theme, promp
 }
 
 /// Read one of the pod's streams to its end, sending each line as it
-/// completes. A line longer than [`CAPTURE_LINE_MAX`] is sent as its
-/// head; the rest is read away rather than kept.
-fn forward_stream(mut reader: impl BufRead, sender: std::sync::mpsc::Sender<String>) {
-    while let Some((mut line, cut)) = next_line(&mut reader) {
-        if cut {
-            line.push_str(" \u{2026}");
+/// completes. A line longer than [`CAPTURE_LINE_MAX`] is sent as its head
+/// with an ellipsis; the rest of it is read away rather than kept, so no
+/// pod can cost the studio the memory of one enormous answer.
+fn forward_stream<R: std::io::Read>(mut reader: R, sender: std::sync::mpsc::Sender<String>) {
+    let mut pending: Vec<u8> = Vec::new();
+    // The tail of a line whose head was already sent: read away, unsent.
+    let mut discarding = false;
+    let mut chunk = [0u8; 1024];
+    loop {
+        // A line at a time out of what is already in hand.
+        while let Some(at) = pending.iter().position(|byte| *byte == b'\n') {
+            if discarding {
+                pending.drain(..=at);
+                discarding = false;
+                continue;
+            }
+            if at >= CAPTURE_LINE_MAX {
+                let head: Vec<u8> = pending.drain(..CAPTURE_LINE_MAX).collect();
+                if send_line(&sender, head, true).is_err() {
+                    return;
+                }
+                pending.drain(..=at - CAPTURE_LINE_MAX);
+                continue;
+            }
+            let line: Vec<u8> = pending.drain(..=at).collect();
+            if send_line(&sender, line, false).is_err() {
+                // The studio is gone; the pipe is closed behind it anyway.
+                return;
+            }
         }
-        if sender.send(line).is_err() {
-            // The studio is gone; the pipe is closed behind it anyway.
-            return;
+        // Still no newline: an overlong line is already underway, so its
+        // head goes out now and whatever follows is thrown away until
+        // its own newline ends it.
+        if !discarding && pending.len() >= CAPTURE_LINE_MAX {
+            let head: Vec<u8> = pending.drain(..CAPTURE_LINE_MAX).collect();
+            if send_line(&sender, head, true).is_err() {
+                return;
+            }
+            discarding = true;
+        }
+        // While discarding, nothing below the newline is kept: the bytes
+        // past the head never had anywhere to go.
+        if discarding {
+            pending.clear();
+        }
+        match reader.read(&mut chunk) {
+            // The end of the stream: a last line with no newline of its
+            // own is still a line.
+            Ok(0) | Err(_) => {
+                if !discarding && !pending.is_empty() {
+                    let _ = send_line(&sender, pending, false);
+                }
+                return;
+            }
+            Ok(count) => pending.extend_from_slice(&chunk[..count]),
         }
     }
 }
 
-/// The next line of `reader`, without its newline, and whether a longer
-/// line was cut to the capture's per-line bound. `None` at the end of
-/// the stream.
-fn next_line(reader: &mut impl BufRead) -> Option<(String, bool)> {
-    let mut line = Vec::new();
-    // One byte past the bound, so a full-length line can be told from a
-    // cut one by whether it still carries its own newline.
-    let read = reader
-        .take(CAPTURE_LINE_MAX as u64 + 1)
-        .read_until(b'\n', &mut line);
-    match read {
-        Ok(0) | Err(_) => None,
-        Ok(_) => {
-            let cut = line.last() != Some(&b'\n');
-            if cut {
-                // Read the rest of the overlong line away, a bound at a
-                // time, without keeping any of it.
-                loop {
-                    let mut rest = Vec::new();
-                    match reader
-                        .take(CAPTURE_LINE_MAX as u64 + 1)
-                        .read_until(b'\n', &mut rest)
-                    {
-                        Ok(0) | Err(_) => break,
-                        Ok(_) if rest.last() == Some(&b'\n') => break,
-                        Ok(_) => {}
-                    }
-                }
-            }
-            while matches!(line.last(), Some(b'\n') | Some(b'\r')) {
-                line.pop();
-            }
-            Some((String::from_utf8_lossy(&line).into_owned(), cut))
-        }
+/// One line as one event, without its newline, marked when it was cut.
+fn send_line(
+    sender: &std::sync::mpsc::Sender<String>,
+    mut bytes: Vec<u8>,
+    cut: bool,
+) -> Result<(), std::sync::mpsc::SendError<()>> {
+    while matches!(bytes.last(), Some(b'\n') | Some(b'\r')) {
+        bytes.pop();
     }
+    let mut line = String::from_utf8_lossy(&bytes).into_owned();
+    if cut {
+        line.push_str(" \u{2026}");
+    }
+    sender
+        .send(line)
+        .map_err(|_| std::sync::mpsc::SendError(()))
 }
 
 impl App {
@@ -338,8 +355,23 @@ impl App {
 
     /// Keys and pastes while the pod prompt has the keyboard. `true`
     /// when it took them; the mouse still reaches whatever is beneath.
+    ///
+    /// The transport stays global, the way it does from the find bar:
+    /// stopping the music works from a prompt. Quit is answered before
+    /// this is offered.
     pub(super) fn pod_prompt_event(&mut self, terminal_event: &Event) -> bool {
         if self.pod_prompt.is_none() {
+            return false;
+        }
+        if let Event::Key(key) = terminal_event
+            && key.kind == KeyEventKind::Press
+            && matches!(
+                self.keybinds.action_for(key),
+                Some(BindAction::Evaluate)
+                    | Some(BindAction::Stop)
+                    | Some(BindAction::RewindEvaluate)
+            )
+        {
             return false;
         }
         let Some(mut prompt) = self.pod_prompt.take() else {
@@ -371,9 +403,9 @@ impl App {
                         if primary && !alt && key.kind == KeyEventKind::Press =>
                     {
                         match self.clipboard.get_text() {
-                            Ok(text) => prompt.insert(
-                                &super::super::file_picker::single_line_paste(&text),
-                            ),
+                            Ok(text) => {
+                                prompt.insert(&super::super::file_picker::single_line_paste(&text))
+                            }
                             Err(error) => self.status = format!("could not paste: {error}"),
                         }
                     }
@@ -618,7 +650,6 @@ mod tests {
 
         use super::super::*;
         use crate::app::tests::support::*;
-        use crate::app::*;
         use std::io::Cursor;
 
         fn pod_lines(app: &App) -> Vec<&str> {
@@ -666,7 +697,7 @@ mod tests {
             assert_eq!(
                 pod_arguments("my-agent {set}", "go", set, None).unwrap(),
                 ["my-agent", "/sets/night", "go"],
-                "no {prompt}: the prompt is the final argument"
+                "with no {{prompt}} placeholder the prompt is the final argument"
             );
             assert_eq!(
                 pod_arguments("--prompt={prompt}", "a b", set, None).unwrap(),
@@ -688,7 +719,11 @@ mod tests {
             }
             assert_eq!(capture.lines.len(), CAPTURE_MAX_LINES, "the line cap holds");
             assert_eq!(capture.dropped, 40);
-            assert_eq!(capture.lines.front().unwrap(), "line 40", "the tail is kept");
+            assert_eq!(
+                capture.lines.front().unwrap(),
+                "line 40",
+                "the tail is kept"
+            );
             assert_eq!(capture.lines.back().unwrap(), "line 239");
             let before = capture.bytes;
             capture.push("x".repeat(CAPTURE_MAX_BYTES));
@@ -714,8 +749,11 @@ mod tests {
             forward_stream(Cursor::new(stream), sender);
             let lines: Vec<String> = receiver.into_iter().collect();
             assert_eq!(lines.len(), 2, "the overlong line is one event");
-            assert_eq!(lines[0].chars().count(), CAPTURE_LINE_MAX);
-            assert!(lines[0].chars().all(|character| character == 'a'));
+            assert_eq!(
+                lines[0],
+                format!("{head} \u{2026}"),
+                "the line is cut to its head and marked"
+            );
             assert_eq!(lines[1], "after the long line");
         }
 
@@ -723,8 +761,13 @@ mod tests {
         fn the_prompt_hides_until_a_command_is_set() {
             let directory = tempfile::tempdir().expect("temp dir");
             let (mut app, _) = plain_app(directory.path(), "$: s(\"bd\")\n");
+            let score = app.editor().source();
             let chord = |app: &mut App| {
-                press(app, KeyCode::Char('j'), KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+                press(
+                    app,
+                    KeyCode::Char('j'),
+                    KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                );
             };
             chord(&mut app);
             assert!(app.pod_prompt.is_none(), "the prompt stays hidden");
@@ -733,23 +776,23 @@ mod tests {
             app.ui_settings.pod_command = pod_command_configured();
             chord(&mut app);
             assert!(app.pod_prompt.is_some(), "the prompt opens");
-            assert!(app.status.contains("Enter runs /bin/echo"), "{}", app.status);
+            assert!(
+                app.status.contains("Enter runs /bin/echo"),
+                "{}",
+                app.status
+            );
             type_text(&mut app, "make it funky");
             assert_eq!(
                 app.pod_prompt.as_ref().expect("the prompt").text,
                 "make it funky",
                 "typing lands in the prompt"
             );
-            assert_eq!(
-                app.editor().source(),
-                "$: s(\"bd\")\n",
-                "none of it reached the score"
-            );
+            assert_eq!(app.editor().source(), score, "none of it reached the score");
             press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
             assert!(app.pod_prompt.is_none());
             assert_eq!(
                 app.editor().source(),
-                "$: s(\"bd\")\n",
+                score,
                 "the score is untouched throughout"
             );
         }
@@ -774,7 +817,10 @@ mod tests {
             );
             // Backspace and the arrows move inside the prompt alone.
             press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
-            assert_eq!(app.pod_prompt.as_ref().expect("the prompt").text, "make it funkie");
+            assert_eq!(
+                app.pod_prompt.as_ref().expect("the prompt").text,
+                "make it funkie"
+            );
             press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
             assert!(app.pod_prompt.is_none());
         }
@@ -835,10 +881,11 @@ mod tests {
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
             let run = app.pod_run.as_ref().expect("the pod runs");
             assert_eq!(run.program, "/bin/echo");
-            assert!(app
-                .background_jobs()
-                .iter()
-                .any(|job| job.name == "pod /bin/echo"));
+            assert!(
+                app.background_jobs()
+                    .iter()
+                    .any(|job| job.name == "pod /bin/echo")
+            );
 
             for _ in 0..100 {
                 app.pump_pod();

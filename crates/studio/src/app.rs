@@ -186,6 +186,7 @@ mod panes;
 mod permissions;
 mod persistence;
 mod piano_mode;
+mod pod;
 mod pointer_shape;
 mod power_advisory;
 mod prebakes;

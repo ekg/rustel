@@ -534,7 +534,14 @@ fn shortcut_rows_with_keybinds(
             "find text: a regular expression; Enter next, Esc closes",
         ),
         HelpRow::new(
-            hint(BindAction::PodPrompt),
+            {
+                let pod = hint(BindAction::PodPrompt);
+                if pod.is_empty() {
+                    "Keybinds page".to_owned()
+                } else {
+                    pod
+                }
+            },
             "pod prompt: send a prompt to the configured pod command, which rewrites the score",
         ),
         HelpRow::new(hint(BindAction::Docs), "docs for the function at the caret"),
