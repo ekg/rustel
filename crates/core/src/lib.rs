@@ -7874,11 +7874,22 @@ impl Pattern {
                 arm();
                 self.query_node_onto(state, out);
             }
-            // In one cycle, each of these asks one pattern one time, and
-            // moves its haps.
-            Node::SplitQueries(_) | Node::SlowCat(_) if state.span.within_one_cycle() => {
+            // A concatenation asks the pattern of one cycle one time, and
+            // moves its haps or leaves them where they are.
+            Node::SlowCat(_) | Node::SlowCatPrime(_) => {
                 arm();
                 self.query_node_onto(state, out);
+            }
+            // Each cycle of the span is an ask of its own, one after the
+            // other, and the slice goes on to each.
+            Node::SplitQueries(_) => {
+                for cycle in state.span.span_cycles() {
+                    if thread.stop_requested() {
+                        break;
+                    }
+                    arm();
+                    self.query_node_onto(&state.set_span(cycle), out);
+                }
             }
             _ => {
                 if !thread.meet_units(1).is_empty() {
@@ -14940,7 +14951,29 @@ mod restart_tests {
                 "long steps over short ones",
                 stack(vec![steps(210, 2), steps(220, 16)]),
             ),
+            // A cycle of the song is more than a cycle of its patterns:
+            // one that asks for each cycle, and one that does not.
+            (
+                "patterns in turn at a tempo",
+                stack(vec![
+                    in_turn(300).split_queries(),
+                    in_turn(340),
+                    Pattern::of(Node::SlowCatPrime(vec![in_turn(360), steps(370, 3)]))
+                        .split_queries(),
+                    steps(380, 2),
+                ])
+                .cpm(Fraction::int(35)),
+            ),
         ]
+    }
+
+    /// Three patterns, one a cycle: steps, lanes, and steps of two cycles.
+    fn in_turn(from: i32) -> Pattern {
+        slowcat(vec![
+            steps(from, 2),
+            stack(vec![steps(from + 10, 3), note(f64::from(from + 15))]),
+            steps(from + 20, 4).slow(whole(2)),
+        ])
     }
 
     /// The parts of the walk of a cycle, one after the other, are the
