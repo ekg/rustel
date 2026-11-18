@@ -23,7 +23,7 @@
 
 use std::cmp::Ordering;
 use std::fmt;
-use std::num::NonZeroI128;
+use std::num::{NonZeroI128, NonZeroU16};
 use std::str::FromStr;
 
 use num_bigint::{BigInt, BigUint, Sign};
@@ -90,6 +90,68 @@ fn gcd_u64(mut a: u64, mut b: u64) -> u64 {
         b = t;
     }
     a
+}
+
+/// A grid of equally spaced ticks per cycle. Each residue gives the common
+/// divisor of its tick and the grid denominator, and the reduced denominator.
+#[derive(Debug)]
+pub struct TickGrid {
+    reductions: Box<[(NonZeroU16, NonZeroU16)]>,
+}
+
+impl TickGrid {
+    /// Four bytes per residue keep the grid within four KiB.
+    pub const MAX_DENOM: i64 = 1024;
+
+    /// A grid with `denom` ticks per cycle, when it fits the table.
+    pub fn new(denom: i64) -> Option<Self> {
+        if !(1..=Self::MAX_DENOM).contains(&denom) {
+            return None;
+        }
+        let denom = denom as u16;
+        let reductions = (0..denom)
+            .map(|residue| {
+                let gcd = gcd_u64(u64::from(residue), u64::from(denom)) as u16;
+                (
+                    NonZeroU16::new(gcd).expect("a positive common divisor"),
+                    NonZeroU16::new(denom / gcd).expect("a positive denominator"),
+                )
+            })
+            .collect();
+        Some(Self { reductions })
+    }
+
+    #[inline]
+    pub fn denom(&self) -> i64 {
+        self.reductions.len() as i64
+    }
+
+    /// The signed tick at `time`, when it lies on this grid and fits in a word.
+    #[inline]
+    pub fn ticks(&self, time: Fraction) -> Option<i64> {
+        let n = i64::try_from(time.numer()).ok()?;
+        let d = usize::try_from(time.denom()).ok()?;
+        if d == self.reductions.len() {
+            return Some(n);
+        }
+        let &(gcd, scale) = self.reductions.get(d)?;
+        if usize::from(gcd.get()) != d {
+            return None;
+        }
+        n.checked_mul(i64::from(scale.get()))
+    }
+
+    /// The reduced time of a signed tick. The residue of its magnitude
+    /// selects the same common divisor for both signs.
+    #[inline]
+    pub fn time(&self, ticks: i64) -> Fraction {
+        let residue = ticks.unsigned_abs() % self.reductions.len() as u64;
+        let (gcd, denominator) = self.reductions[residue as usize];
+        Fraction {
+            n: i128::from(ticks / i64::from(gcd.get())),
+            d: den(i128::from(denominator.get())),
+        }
+    }
 }
 
 /// Reduce a numerator and a positive denominator from the 64-bit path.
@@ -1771,5 +1833,38 @@ mod native_fast_path_tests {
                 "{n}/{d}"
             );
         }
+    }
+
+    #[test]
+    fn ticks_have_the_same_reduced_time_as_exact_division() {
+        for denom in [1, 8, 11, 15, 96, 176, 257, TickGrid::MAX_DENOM] {
+            let grid = TickGrid::new(denom).unwrap();
+            assert_eq!(grid.denom(), denom);
+            for tick in (-2 * denom..=2 * denom).chain([i64::MIN, i64::MIN + 1, i64::MAX]) {
+                let exact = Fraction::new(i128::from(tick), i128::from(denom));
+                assert_eq!(grid.time(tick), exact, "tick {tick} of {denom}");
+                assert_eq!(grid.ticks(exact), Some(tick));
+            }
+        }
+    }
+
+    #[test]
+    fn a_grid_accepts_only_its_representable_ticks() {
+        for denom in [-1, 0, TickGrid::MAX_DENOM + 1, i64::MAX] {
+            assert!(TickGrid::new(denom).is_none());
+        }
+        let grid = TickGrid::new(24).unwrap();
+        for d in 1..=32 {
+            for n in [-13, 0, 7, i128::from(i64::MAX), i128::from(i64::MIN)] {
+                let time = Fraction::new(n, d);
+                let scaled = time * Fraction::int(24);
+                let expected = (scaled.denom() == 1)
+                    .then(|| i64::try_from(scaled.numer()).ok())
+                    .flatten();
+                assert_eq!(grid.ticks(time), expected, "{time:?}");
+            }
+        }
+        assert_eq!(grid.ticks(Fraction::int(i128::MAX)), None);
+        assert_eq!(grid.ticks(Fraction::new(1, i128::MAX)), None);
     }
 }

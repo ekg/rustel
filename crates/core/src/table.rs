@@ -1004,10 +1004,147 @@ pub(crate) struct Run {
     controls: crate::OrderedMap,
     state: SettingsStateId,
     kept: Option<Kept>,
+    /// The answer of the cycle after the span, which the queries of the
+    /// run build in parts. One query at a time builds a part: the lock is
+    /// taken with no wait.
+    ahead: std::sync::Mutex<Ahead>,
     /// Whether the last query at the root was none of this run. A second
     /// one in a row ends the run. One query of another caller between two
     /// queries of the run so ends nothing.
     stranger: AtomicBool,
+}
+
+/// The answer of the cycle after a [`Run`], built in parts. Each query of
+/// the run walks some units of the graph for the whole cycle: a unit is a
+/// layer of a sequence, or a node that answers whole. The cycle then
+/// begins with its answer kept, and no query pays the walk of a whole
+/// cycle.
+#[derive(Debug, Default)]
+pub(crate) struct Ahead {
+    /// The haps of the units that are walked, in the order of the graph.
+    haps: Vec<Hap>,
+    /// How many units are walked.
+    walked: usize,
+    /// How many units the graph has. `None` before the first walk.
+    units: Option<usize>,
+    /// Whether the haps hold data only, as each walk said.
+    data_only: bool,
+    /// Whether a walk gave no answer to keep. The cycle is then walked
+    /// whole when it begins.
+    failed: bool,
+    /// What the first walk met at each node, for the walks after it.
+    seen: Vec<crate::Seen>,
+    /// How many walks build the cycle, and how many units the cycle
+    /// before it had: what its plan is. `None` for a cycle with no cycle
+    /// kept before it, which each query of the run walks a share of.
+    plan: Option<Plan>,
+}
+
+/// The plan of the walks of a cycle, from the cycle that the run keeps.
+#[derive(Clone, Copy, Debug)]
+struct Plan {
+    /// The walks that are left.
+    walks: usize,
+    /// The units of the cycle before: the best guess before the first
+    /// walk says how many this cycle has.
+    units: usize,
+}
+
+impl Ahead {
+    /// Whether each unit is walked: the haps are the answer of the cycle.
+    pub(crate) fn is_whole(&self) -> bool {
+        self.units.is_some_and(|units| self.walked >= units)
+    }
+
+    /// Whether a walk failed.
+    pub(crate) fn failed(&self) -> bool {
+        self.failed
+    }
+
+    /// The most haps that one walk of a planned cycle makes, as the cycle
+    /// before it says. Each walk pays for the nodes above its units again,
+    /// so a cycle of few haps takes few walks.
+    const HAPS_A_WALK: usize = 5;
+
+    /// An answer to build after a cycle of `haps` haps and `units` units.
+    fn planned(haps: usize, units: usize) -> Self {
+        Self {
+            // Room for as many haps as the cycle before, with none to move.
+            haps: Vec::with_capacity(haps),
+            plan: Some(Plan {
+                walks: haps.div_ceil(Self::HAPS_A_WALK).max(1),
+                units,
+            }),
+            ..Self::default()
+        }
+    }
+
+    /// The units to walk now, when `left` more queries of the run come
+    /// before the cycle begins: an even share of the units that are left,
+    /// for the walks of the plan or for each query. Before the first walk
+    /// says how many units the cycle has, the plan guesses, and a cycle
+    /// with no plan walks one unit.
+    pub(crate) fn share(&self, left: usize) -> std::ops::Range<usize> {
+        let guess = self.plan.map_or(1, |plan| plan.units.max(1));
+        let rest = self
+            .units
+            .map_or(guess, |units| units.saturating_sub(self.walked));
+        let walks = self
+            .plan
+            .map_or(left + 1, |plan| plan.walks.clamp(1, left + 1));
+        self.walked..self.walked + rest.div_ceil(walks)
+    }
+
+    /// The units that are left, for the query that begins the cycle.
+    pub(crate) fn rest(&self) -> std::ops::Range<usize> {
+        self.walked..usize::MAX
+    }
+
+    /// The haps so far, for a walk that writes after them.
+    pub(crate) fn take_haps(&mut self) -> Vec<Hap> {
+        std::mem::take(&mut self.haps)
+    }
+
+    /// Keep `haps`, the haps before a walk and the answer of the walk of
+    /// the units up to `to`, of the `units` that the walk met. A walk that
+    /// met another count than the walk before it, and more haps than a run
+    /// keeps, are failures.
+    pub(crate) fn add(
+        &mut self,
+        haps: Vec<Hap>,
+        data_only: bool,
+        to: usize,
+        units: usize,
+        seen: Vec<crate::Seen>,
+    ) {
+        let first = self.units.is_none();
+        self.failed |= !first && self.units != Some(units);
+        self.data_only = (first || self.data_only) && data_only;
+        self.failed |= haps.len() as u64 > Run::MOST_HAPS;
+        (self.haps, self.seen) = (haps, seen);
+        self.walked = to.min(units);
+        self.units = Some(units);
+        if let Some(plan) = &mut self.plan {
+            plan.walks = plan.walks.saturating_sub(1);
+        }
+    }
+
+    /// The notes of the walks so far, for the next walk.
+    pub(crate) fn take_seen(&mut self) -> Vec<crate::Seen> {
+        std::mem::take(&mut self.seen)
+    }
+
+    /// A walk gave no answer to keep.
+    pub(crate) fn fail(&mut self) {
+        self.failed = true;
+    }
+
+    /// The answer to keep, when each unit is walked and no walk failed,
+    /// and how many units it has.
+    pub(crate) fn into_kept(self) -> Option<(Kept, usize)> {
+        let units = self.units.filter(|_| self.is_whole() && !self.failed)?;
+        Some((Kept::of(self.haps, self.data_only)?, units))
+    }
 }
 
 /// The answer that a [`Run`] keeps: the haps of its span, in the order of
@@ -1060,8 +1197,11 @@ impl Run {
 
     /// A run that keeps `kept`, the answer of `span`, for queries as
     /// `state`.
-    pub(crate) fn of(span: TimeSpan, state: &State, kept: Kept) -> Self {
+    /// The answer has `units` units: the cycle after it is planned from
+    /// it.
+    pub(crate) fn of(span: TimeSpan, state: &State, kept: Kept, units: usize) -> Self {
         Self {
+            ahead: std::sync::Mutex::new(Ahead::planned(kept.haps.len(), units)),
             kept: Some(kept),
             ..Self::walked(span, state)
         }
@@ -1074,8 +1214,19 @@ impl Run {
             controls: state.controls.clone(),
             state: crate::settings::current_state_id(),
             kept: None,
+            ahead: std::sync::Mutex::default(),
             stranger: AtomicBool::new(false),
         }
+    }
+
+    /// This run with no kept answer, after the last query that the answer
+    /// holds: the span, and the answer that its queries built ahead.
+    pub(crate) fn without_kept(&self, state: &State) -> Self {
+        let run = Self::walked(self.span, state);
+        if let (Some(mut built), Some(mut ahead)) = (self.ahead(), run.ahead()) {
+            std::mem::swap(&mut *built, &mut *ahead);
+        }
+        run
     }
 
     /// [`Self::walked`] for a rest whose answer was refused: the graph
@@ -1085,11 +1236,29 @@ impl Run {
             .end
             .checked_add_int(Self::REFUSED_CYCLES)
             .unwrap_or(rest.end);
-        Self::walked(TimeSpan::new(rest.begin, end), state)
+        let run = Self::walked(TimeSpan::new(rest.begin, end), state);
+        // The cycle after the refused ones is walked whole when it comes:
+        // its parts would wait for it through each of them.
+        if let Some(mut ahead) = run.ahead() {
+            ahead.fail();
+        }
+        run
     }
 
     pub(crate) fn span(&self) -> TimeSpan {
         self.span
+    }
+
+    /// The cycle after the span, when the span ends with a cycle.
+    pub(crate) fn cycle_ahead(&self) -> Option<TimeSpan> {
+        let end = self.span.end.checked_add_int(1)?;
+        (self.span.end.denom() == 1).then(|| TimeSpan::new(self.span.end, end))
+    }
+
+    /// The answer of [`Self::cycle_ahead`] that the run builds, for the
+    /// one query that builds a part now. `None` while another query does.
+    pub(crate) fn ahead(&self) -> Option<std::sync::MutexGuard<'_, Ahead>> {
+        self.ahead.try_lock().ok()
     }
 
     /// The answer that the run keeps for the queries of its span. `None`

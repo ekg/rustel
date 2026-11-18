@@ -172,7 +172,7 @@ pub enum GivenLayer {
 #[derive(Clone)]
 enum Steps {
     /// Each step at its place.
-    Places(Arc<[Place]>),
+    Places(Listed),
     /// The steps as their source writes them for each query.
     Source(Arc<Sourced>),
 }
@@ -181,7 +181,29 @@ enum Steps {
 /// them: each layer that a fold makes of the same steps shares them.
 struct Sourced {
     steps: Arc<dyn StepSource>,
-    places: OnceLock<Arc<[Place]>>,
+    places: OnceLock<Listed>,
+}
+
+/// The places of one layer and whether their times fit a restart at a small offset.
+#[derive(Clone)]
+struct Listed {
+    places: Arc<[Place]>,
+    small_denominators: bool,
+}
+
+impl Listed {
+    fn new(places: Arc<[Place]>) -> Self {
+        let small = |span: &TimeSpan| {
+            i32::try_from(span.begin.denom()).is_ok() && i32::try_from(span.end.denom()).is_ok()
+        };
+        let small_denominators = places
+            .iter()
+            .all(|place| small(&place.whole) && place.part.as_deref().is_none_or(small));
+        Self {
+            places,
+            small_denominators,
+        }
+    }
 }
 
 /// Where one step of a layer is, and which value it holds.
@@ -367,7 +389,12 @@ enum SequenceStop {
 impl Layer {
     fn new(period: Fraction, places: Arc<[Place]>, values: Arc<[Value]>) -> Self {
         let in_cycles = lie_in_cycles(period, &places);
-        Self::holding(period, Steps::Places(places), in_cycles, values)
+        Self::holding(
+            period,
+            Steps::Places(Listed::new(places)),
+            in_cycles,
+            values,
+        )
     }
 
     /// The layer of `layer`, which reads its steps from their source.
@@ -403,8 +430,8 @@ impl Layer {
     /// first call: a fold that moves or cuts steps reads them here, and a
     /// query does not.
     fn places(&self) -> &[Place] {
-        match &self.steps {
-            Steps::Places(places) => places,
+        &match &self.steps {
+            Steps::Places(listed) => listed,
             Steps::Source(sourced) => sourced.places.get_or_init(|| {
                 let mut places = Vec::with_capacity(sourced.steps.count());
                 let written = sourced
@@ -414,9 +441,10 @@ impl Layer {
                         places.push(Place::at(whole, None, step.value, step.locations));
                     });
                 debug_assert!(written.is_some(), "a source reads its period");
-                places.into()
+                Listed::new(places.into())
             }),
         }
+        .places
     }
 
     /// The source of the steps, when no fold made their places.
@@ -749,7 +777,11 @@ impl Layer {
         others: usize,
         out: &mut Vec<Hap>,
     ) -> Result<(), SequenceStop> {
-        if let Some(source) = self.source() {
+        // A few steps cost less to keep than to walk at every query.
+        const KEPT_STEPS: usize = 8;
+        if let Some(source) = self.source()
+            && source.count() > KEPT_STEPS
+        {
             let held = out.len();
             if let Some(pushed) = self.push_written(source, turn, span, others, out) {
                 return pushed;
@@ -793,16 +825,11 @@ impl Layer {
         out.reserve(met);
         for (index, place) in places.iter().enumerate().skip(first).take(met) {
             let whole = TimeSpan::new(turn.moved(place.whole.begin)?, turn.moved(place.whole.end)?);
-            let within = place.part();
-            let part = match &place.part {
-                // A step that is not cut and lies in the span is its
-                // whole.
-                None if within.begin >= turn.begin && within.end <= turn.end => whole,
-                _ => TimeSpan::new(
-                    turn.moved(within.begin)?.max(span.begin),
-                    turn.moved(within.end)?.min(span.end),
-                ),
+            let visible = match &place.part {
+                None => whole,
+                Some(part) => TimeSpan::new(turn.moved(part.begin)?, turn.moved(part.end)?),
             };
+            let part = TimeSpan::new(visible.begin.max(span.begin), visible.end.min(span.end));
             out.push(self.hap_at(index, whole, part));
         }
         note_accumulated(out.len() - others);
@@ -831,11 +858,7 @@ impl Layer {
                 Err(range) => return stop = Some(range),
             };
             let whole = TimeSpan::new(begin, end);
-            // A step that lies in the span is its whole.
-            let part = match step.begin >= turn.begin && step.end <= turn.end {
-                true => whole,
-                false => TimeSpan::new(begin.max(span.begin), end.min(span.end)),
-            };
+            let part = TimeSpan::new(begin.max(span.begin), end.min(span.end));
             let value = self.values()[step.value as usize].clone();
             let mut hap = Hap::new(Some(whole), part, value);
             hap.context = match self.before.is_empty() && self.after.is_empty() {
@@ -1004,7 +1027,7 @@ impl Layer {
         let met = Layer {
             in_cycles: lie_in_cycles(period, &places),
             period,
-            steps: Steps::Places(places.into()),
+            steps: Steps::Places(Listed::new(places.into())),
             before: Locations::new(),
             after: match side {
                 Side::Functions => self.after.clone(),
@@ -1208,6 +1231,13 @@ fn query_layers(
         return Ok(());
     };
     let mut turns = Turns::of(first.period, span)?;
+    if turns.indices.end.checked_sub(turns.indices.start) == Some(1) {
+        let turn = turns.turn(turns.indices.start)?;
+        for layer in layers {
+            layer.push(&turn, span, from, out)?;
+        }
+        return Ok(());
+    }
     for layer in layers {
         for index in turns.indices.clone() {
             // The query of the node asked before the first turn.
@@ -1229,9 +1259,9 @@ pub(crate) fn query_sequence_onto(layers: &[Layer], state: &State, out: &mut Vec
     // one meets few, and takes room as its haps come.
     let span = state.span;
     let long = span
-        .end
-        .checked_sub(span.begin)
-        .is_some_and(|width| width >= Fraction::ONE);
+        .begin
+        .checked_add_int(1)
+        .is_some_and(|after_cycle| span.end >= after_cycle);
     if long {
         let steps: usize = layers.iter().map(Layer::count).sum();
         out.reserve(steps.min(MOST_ROOM));
@@ -1251,6 +1281,27 @@ pub(crate) fn query_sequence_onto(layers: &[Layer], state: &State, out: &mut Vec
             }
         }
     }
+}
+
+/// Whether moving these layers by `by` leaves every step in place.
+pub(crate) fn repeats_at(layers: &[Layer], by: Fraction, span: TimeSpan) -> bool {
+    // Both readings must fit, including each whole before the query cuts it.
+    let small =
+        |time: Fraction| i32::try_from(time.numer()).is_ok() && i32::try_from(time.denom()).is_ok();
+    if by.denom() != 1 || !small(by) || !small(span.begin) || !small(span.end) {
+        return false;
+    }
+    layers.iter().all(|layer| {
+        let listed = match &layer.steps {
+            Steps::Places(listed) => Some(listed),
+            Steps::Source(source) => source.places.get(),
+        };
+        let period = layer.period;
+        // An integer multiple of the reduced numerator is a whole number of periods.
+        listed.is_some_and(|listed| listed.small_denominators)
+            && small(period)
+            && (period.numer() == 1 || (by.numer() as i32) % (period.numer() as i32) == 0)
+    })
 }
 
 /// Whether each hap of `layers` holds data only.
@@ -1806,7 +1857,7 @@ pub(crate) fn filtered(pattern: &Pattern, keep: &ValuePredicate) -> Option<Patte
                     .collect();
                 layer.with(|layer| {
                     layer.in_cycles = lie_in_cycles(layer.period, &places);
-                    layer.steps = Steps::Places(places);
+                    layer.steps = Steps::Places(Listed::new(places));
                 })
             })
             .collect();
@@ -1869,7 +1920,7 @@ pub(crate) fn faster(pattern: &Pattern, factor: Fraction) -> Option<Pattern> {
             Some(layer.with(|layer| {
                 layer.in_cycles = lie_in_cycles(period, &places);
                 layer.period = period;
-                layer.steps = Steps::Places(places);
+                layer.steps = Steps::Places(Listed::new(places));
             }))
         })
         .collect::<Option<Vec<_>>>()?;
@@ -2666,6 +2717,35 @@ mod tests {
                 answers(&twice(&listed), begin, end),
                 "twice as fast, over {begin:?}..{end:?}"
             );
+        }
+    }
+
+    #[test]
+    fn a_short_source_in_a_long_period_keeps_its_rests_and_locations() {
+        let period = Fraction::int(8);
+        let read = sequence_of(vec![GivenLayer::Sourced(SourcedLayer {
+            period,
+            values: (0..4).map(|at| Value::F64(f64::from(at))).collect(),
+            in_cycles: true,
+            steps: Arc::new(Quarters),
+        })])
+        .unwrap();
+        let steps = (0..4)
+            .map(|at| step((at, 32), (at + 1, 32), at as f64))
+            .collect();
+        let listed = built(&[SequenceLayer { period, steps }]);
+        let located = |pattern: Pattern| pattern.with_added_context(vec![(70, 72)]).mark_walked();
+        let (read, listed) = (located(read), located(listed));
+        for eighth in -67..=67 {
+            let begin = Fraction::new(eighth, 8);
+            for width in [Fraction::ZERO, frac((1, 7)), frac((17, 2))] {
+                let end = begin + width;
+                assert_eq!(
+                    answers(&read, begin, end),
+                    answers(&listed, begin, end),
+                    "{begin:?}..{end:?}"
+                );
+            }
         }
     }
 

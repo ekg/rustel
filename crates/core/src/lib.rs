@@ -592,17 +592,35 @@ impl Hap {
         self.part = f(&self.part);
     }
 
-    /// Each time of the hap through `map`, which gives one time for one
-    /// time. A hap that is not cut reads the times of its part one time.
-    fn map_times(&mut self, map: impl Fn(Fraction) -> Fraction) {
-        let part = self.part.with_time(&map);
-        if let Some(whole) = self.whole.as_mut() {
-            *whole = match *whole == self.part {
-                true => part,
-                false => whole.with_time(&map),
+    /// Haps cut by the same query share the mapped times of its edges.
+    fn map_times(haps: &mut [Self], span: TimeSpan, map: impl Fn(Fraction) -> Fraction) {
+        let mut begin = None;
+        let mut end = None;
+        for hap in haps {
+            let part = hap.part;
+            hap.part.begin = if part.begin == span.begin {
+                *begin.get_or_insert_with(|| map(part.begin))
+            } else {
+                map(part.begin)
             };
+            hap.part.end = if part.end == span.end {
+                *end.get_or_insert_with(|| map(part.end))
+            } else {
+                map(part.end)
+            };
+            if let Some(whole) = &mut hap.whole {
+                whole.begin = if whole.begin == part.begin {
+                    hap.part.begin
+                } else {
+                    map(whole.begin)
+                };
+                whole.end = if whole.end == part.end {
+                    hap.part.end
+                } else {
+                    map(whole.end)
+                };
+            }
         }
-        self.part = part;
     }
 
     /// Replace only the visible part of a hap, retaining its notional whole.
@@ -2076,7 +2094,39 @@ struct TempoRate {
     /// The speed change at the tempo that asked first, with the bits of
     /// that tempo. A float reads as a fraction slowly, and a session seldom
     /// changes its tempo.
-    read: std::sync::OnceLock<(u64, Option<Fraction>)>,
+    read: std::sync::OnceLock<(u64, Option<Fraction>, Option<TempoGrid>)>,
+}
+
+/// A sixteenth of a child cycle as ticks of the scheduler.
+struct TempoGrid {
+    grid: rustel_fraction::TickGrid,
+    cycle_ticks: i64,
+}
+
+impl TempoGrid {
+    const STEPS: i64 = 16;
+
+    fn new(speed: Fraction) -> Option<Self> {
+        if speed <= Fraction::ZERO || speed == Fraction::ONE {
+            return None;
+        }
+        let tick = Fraction::new(1, i128::from(Self::STEPS)).checked_div(speed)?;
+        Some(Self {
+            grid: rustel_fraction::TickGrid::new(i64::try_from(tick.denom()).ok()?)?,
+            cycle_ticks: i64::try_from(tick.numer()).ok()?.checked_mul(Self::STEPS)?,
+        })
+    }
+
+    #[inline]
+    fn time(&self, time: Fraction) -> Option<Fraction> {
+        let d = time.denom();
+        if d > i128::from(Self::STEPS) || !(d as u32).is_power_of_two() {
+            return None;
+        }
+        let n = i64::try_from(time.numer()).ok()?;
+        let ticks = n.checked_mul(self.cycle_ticks >> d.trailing_zeros())?;
+        Some(self.grid.time(ticks))
+    }
 }
 
 impl TempoRate {
@@ -2089,12 +2139,15 @@ impl TempoRate {
 
     /// How many times as fast the pattern runs at `cps` cycles each second
     /// of the scheduler. `None` for a speed outside the native range.
-    fn speed_at(&self, cps: f64) -> Option<Fraction> {
+    fn speed_at(&self, cps: f64) -> Option<(Fraction, Option<&TempoGrid>)> {
         let read = || Fraction::from_f64(self.cpm.to_f64() / 60.0 / cps);
-        let (kept, speed) = *self.read.get_or_init(|| (cps.to_bits(), read()));
-        match kept == cps.to_bits() {
-            true => speed,
-            false => read(),
+        let (kept, speed, grid) = self.read.get_or_init(|| {
+            let speed = read();
+            (cps.to_bits(), speed, speed.and_then(TempoGrid::new))
+        });
+        match *kept == cps.to_bits() {
+            true => Some(((*speed)?, grid.as_ref())),
+            false => Some((read()?, None)),
         }
     }
 }
@@ -2656,6 +2709,22 @@ fn query_stack_child<T>(query: impl FnOnce() -> Vec<T>) -> Vec<T> {
     }
 }
 
+/// The haps of the children `pats` of a stack, after those of `out`. Each
+/// child writes after the one before it. A child that fails writes
+/// nothing, and its siblings stay. `before` runs before each child is
+/// asked.
+fn query_stack_onto(pats: &[Pattern], state: &State, out: &mut Vec<Hap>, before: impl Fn()) {
+    let from = out.len();
+    for pat in pats.iter().filter(|pat| !pat.is_rest()) {
+        before();
+        stack_child_onto(out, |out| pat.query_onto(state, out));
+        if !charge_held(out.len() - from) {
+            out.truncate(from);
+            return;
+        }
+    }
+}
+
 /// [`query_stack_child`] for a child that writes its haps after those of
 /// `out`: the haps of a child that failed go, and those before them stay.
 fn stack_child_onto(out: &mut Vec<Hap>, query: impl FnOnce(&mut Vec<Hap>)) {
@@ -3023,6 +3092,10 @@ struct QueryThread {
     deadline_expired: std::cell::Cell<bool>,
     walked: std::cell::Cell<bool>,
     part_asked: std::cell::Cell<PartAsked>,
+    /// The depth of the node that may take the slice of this walk, or
+    /// zero for a walk with no slice. See [`Slice`].
+    slice_armed: std::cell::Cell<u32>,
+    slice: std::cell::Cell<Slice>,
     /// Set while a cancellable query runs. Erased to a pointer because
     /// the flag is owned by the caller and shared with whatever thread
     /// will set it.
@@ -3130,6 +3203,168 @@ impl QueryThread {
     }
 }
 
+/// A share of one walk of a graph, for a run that builds an answer in
+/// parts: the units of the walk from `from` up to `to`, in the order of
+/// the walk. The answers of the shares of a walk, one after the other,
+/// are the answer of the walk.
+///
+/// The slice goes down from the root through each stack, and through each
+/// node that hands on the haps of its one child, hap by hap. A layer of a
+/// sequence is a unit, and so is a node of any other kind: it answers
+/// whole, or not at all.
+///
+/// The first walk of a graph meets each unit, and notes what it met at
+/// each node. A later walk reads the notes in the same order, and goes
+/// under a node only for units that its slice asks for.
+#[derive(Clone, Copy)]
+struct Slice {
+    from: usize,
+    to: usize,
+    /// The units that the walk met so far.
+    met: usize,
+    /// The note of the next node that the walk visits.
+    next: usize,
+    /// Whether the walk writes the notes, as the first walk does.
+    first: bool,
+    /// Whether the walk met another graph than the notes say.
+    failed: bool,
+}
+
+impl Slice {
+    const NONE: Self = Self {
+        from: 0,
+        to: 0,
+        met: 0,
+        next: 0,
+        first: false,
+        failed: false,
+    };
+}
+
+/// What a walk with a [`Slice`] says when it ends: how many units it met,
+/// and the notes for the walks after it.
+type Sliced = (usize, Vec<Seen>);
+
+/// What the first walk with a [`Slice`] met at one node.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Seen {
+    /// The node, by its place in memory: a check that a later walk visits
+    /// the same graph.
+    node: usize,
+    /// The units of the node: `count` of them from `first` on.
+    first: usize,
+    count: usize,
+    /// How many notes the node and the nodes under it have.
+    notes: usize,
+}
+
+impl QueryThread {
+    /// Meet `count` units of the walk, for the node at the armed depth
+    /// that holds them: which of them the slice asks for.
+    fn meet_units(&self, count: usize) -> std::ops::Range<usize> {
+        let slice = self.slice.get();
+        let (first, end) = (slice.met, slice.met + count);
+        self.slice.set(Slice { met: end, ..slice });
+        slice.from.clamp(first, end) - first..slice.to.clamp(first, end) - first
+    }
+
+    /// The walk is no slice: its answer is not kept.
+    fn fail_slice(&self) {
+        self.slice.set(Slice {
+            failed: true,
+            ..self.slice.get()
+        });
+    }
+
+    /// Read or write the note at `at`.
+    fn with_note<R>(&self, at: usize, note: impl FnOnce(Option<&mut Seen>) -> R) -> R {
+        SLICE_SEEN.with(|notes| {
+            let mut seen = notes.take();
+            let answer = note(seen.get_mut(at));
+            notes.set(seen);
+            answer
+        })
+    }
+
+    /// Begin the visit of `node` in a walk with a slice: the units that
+    /// the walk met before the node, and the place of the note of the
+    /// node. `None` when the slice asks for no unit of the node: the walk
+    /// then goes past it.
+    fn enter_slice(&self, node: usize) -> Option<(usize, usize)> {
+        let slice = self.slice.get();
+        let at = slice.next;
+        if slice.first {
+            SLICE_SEEN.with(|notes| {
+                let mut seen = notes.take();
+                seen.push(Seen {
+                    node,
+                    first: slice.met,
+                    count: 0,
+                    notes: 0,
+                });
+                notes.set(seen);
+            });
+            self.slice.set(Slice {
+                next: at + 1,
+                ..slice
+            });
+            return Some((slice.met, at));
+        }
+        let Some(seen) = self.with_note(at, |note| note.copied()) else {
+            self.slice.set(Slice {
+                failed: true,
+                ..slice
+            });
+            return Some((slice.met, at));
+        };
+        let end = seen.first + seen.count;
+        if slice.to <= seen.first || end <= slice.from {
+            self.slice_armed.set(0);
+            self.slice.set(Slice {
+                met: end,
+                next: at + seen.notes,
+                ..slice
+            });
+            return None;
+        }
+        self.slice.set(Slice {
+            next: at + 1,
+            failed: slice.failed || seen.node != node || seen.first != slice.met,
+            ..slice
+        });
+        Some((slice.met, at))
+    }
+
+    /// End the visit of a node that began with `first` units met and the
+    /// note at `at`: the first walk writes the note, and a later walk
+    /// checks that it met the same units.
+    fn leave_slice(&self, first: usize, at: usize) {
+        let slice = self.slice.get();
+        let (count, notes) = (slice.met - first, slice.next - at);
+        let same = self.with_note(at, |note| match note {
+            Some(note) if slice.first => {
+                (note.count, note.notes) = (count, notes);
+                true
+            }
+            Some(note) => (note.count, note.notes) == (count, notes),
+            None => false,
+        });
+        if !same {
+            self.slice.set(Slice {
+                failed: true,
+                ..slice
+            });
+        }
+    }
+}
+
+thread_local! {
+    /// The notes of the walk with a [`Slice`] that runs now. They are not
+    /// a field of [`QueryThread`]: its fields need no drop, so a query
+    /// may run while the thread ends.
+    static SLICE_SEEN: std::cell::Cell<Vec<Seen>> = const { std::cell::Cell::new(Vec::new()) };
+}
+
 thread_local! {
     static QUERY_THREAD: QueryThread = const {
         QueryThread {
@@ -3144,6 +3379,8 @@ thread_local! {
             deadline_expired: std::cell::Cell::new(false),
             walked: std::cell::Cell::new(false),
             part_asked: std::cell::Cell::new(PartAsked::No),
+            slice_armed: std::cell::Cell::new(0),
+            slice: std::cell::Cell::new(Slice::NONE),
             cancel: std::cell::Cell::new(None),
             cancel_observed: std::cell::Cell::new(false),
         }
@@ -5017,6 +5254,11 @@ fn restarted_from_tables(
     if query_error_pending() || query_stop_requested() {
         return None;
     }
+    // A slice of a walk goes on to the pattern itself: a table answers
+    // whole.
+    if QUERY_THREAD.with(|thread| thread.slice_armed.get()) != 0 {
+        return None;
+    }
     // `pattern`, which the graph asks with no node for the move.
     let depth = QUERY_DEPTH.with(std::cell::Cell::get).checked_add(1)?;
     let tables = pattern.tables_for_query()?;
@@ -5070,6 +5312,7 @@ fn pick_where_it_is(outer: &Hap, inner: &mut Hap, whole: Option<TimeSpan>, part:
 /// `_pick(...).{inner,outer,squeeze,reset,restart}Join()` out of line, so the
 /// join's nested locals do not enlarge every recursive `query_node` frame.
 /// The haps come after those of `out`. A pick that fails writes none.
+/// `before` runs before each hap of the selector picks its pattern.
 #[inline(never)]
 fn query_pick(
     selector: &Pattern,
@@ -5078,6 +5321,7 @@ fn query_pick(
     mode: JoinMode,
     state: &State,
     out: &mut Vec<Hap>,
+    before: &dyn Fn(),
 ) {
     let from = out.len();
     let picked = with_list(|selectors| {
@@ -5086,6 +5330,7 @@ fn query_pick(
             return None;
         }
         for outer in selectors.drain(..) {
+            before();
             pick_of(&outer, lookup, index_mode, mode, state, from, out)?;
             if query_error_pending() {
                 return None;
@@ -5192,20 +5437,40 @@ fn pick_of(
             } else {
                 outer_whole.begin.cycle_pos()
             };
-            match restarted_from_tables(inner_pattern, shift, state, outer.part) {
-                Some(haps) => hand_over(haps, out),
-                None => inner_pattern.query_restarted_onto(shift, state, outer.part, out),
-            }
-            retain_from(out, picked, |inner| {
-                let Some(part) = inner.part.intersection(&outer.part) else {
-                    return false;
-                };
+            let meet = |inner: &mut Hap, part| {
                 let whole = inner
                     .whole
                     .and_then(|inner_whole| inner_whole.intersection(&outer_whole));
                 pick_where_it_is(outer, inner, whole, part);
-                true
-            });
+            };
+            let walked = QUERY_WALKED.with(std::cell::Cell::get);
+            if walked
+                && let Node::Sequence(layers) = inner_pattern.node_kind()
+                && inner_pattern.is_discrete()
+            {
+                // Each sequence step already lies inside the part it answers.
+                let asked = state.set_span(outer.part);
+                if shift == Fraction::ZERO || sequence::repeats_at(layers, shift, outer.part) {
+                    inner_pattern.query_onto(&asked, out);
+                } else {
+                    inner_pattern.query_moved_onto(shift, "late", &asked, out);
+                }
+                for inner in &mut out[picked..] {
+                    meet(inner, inner.part);
+                }
+            } else {
+                match restarted_from_tables(inner_pattern, shift, state, outer.part) {
+                    Some(haps) => hand_over(haps, out),
+                    None => inner_pattern.query_restarted_onto(shift, state, outer.part, out),
+                }
+                retain_from(out, picked, |inner| {
+                    let Some(part) = inner.part.intersection(&outer.part) else {
+                        return false;
+                    };
+                    meet(inner, part);
+                    true
+                });
+            }
         }
     }
     // The pick holds the haps of each selector hap so far.
@@ -5263,6 +5528,7 @@ fn query_patternified_pick(
                 mode,
                 &state.set_span(lookup_hap.hap.part),
                 &mut selected,
+                &|| {},
             );
         }
         if query_error_pending() {
@@ -6613,12 +6879,17 @@ impl Pattern {
             Some(run)
         };
         let run = match held.as_deref().map(|run| run.met(state)) {
-            Some(Met::Held) => held?,
+            Some(Met::Held) => {
+                let run = held?;
+                // The first query of a cycle holds the most haps of the
+                // cycle: it builds no part of the next one.
+                if run.span().begin < span.begin {
+                    self.walk_ahead(&run, state);
+                }
+                run
+            }
             Some(Met::Next) => put(match Run::rest(span) {
-                Some(rest) => match self.keep_run(rest, state) {
-                    Some(kept) => Run::of(rest, state, kept),
-                    None => Run::refused(rest, state),
-                },
+                Some(rest) => self.next_run(held.as_deref()?, rest, state),
                 // The query ends with its cycle: the next one begins a rest.
                 None => Run::walked(span, state),
             })?,
@@ -6630,6 +6901,11 @@ impl Pattern {
             }
         };
         let kept = run.kept()?;
+        // A query that begins before the kept cycle crosses into it: the
+        // graph answers it.
+        if span.begin < run.span().begin {
+            return None;
+        }
         if query_stop_requested() {
             return Some((Vec::new(), true));
         }
@@ -6640,7 +6916,7 @@ impl Pattern {
         // The last query that the answer holds. No query of the run reads
         // the answer again, so the root keeps the span and frees the haps.
         if span.end == run.span().end {
-            put(Run::walked(run.span(), state));
+            put(run.without_kept(state));
         }
         note_accumulated(haps.len());
         if !charge_haps(haps.len()) {
@@ -6649,14 +6925,140 @@ impl Pattern {
         Some((haps, kept.data_only()))
     }
 
+    /// The run that follows the run `before`, for a query that goes on
+    /// from it with `rest` of its cycle left. The queries of `before`
+    /// built the answer of the cycle after it in parts: the run keeps
+    /// that answer. A run that ends inside a cycle is the first query of
+    /// a run, with no answer built: the graph answers the queries of
+    /// `rest`, and each builds a part of the cycle after it. Where a part
+    /// failed, the cycle is walked whole.
+    fn next_run(&self, before: &table::Run, rest: TimeSpan, state: &State) -> table::Run {
+        use table::Run;
+        let Some(cycle) = before.cycle_ahead() else {
+            return Run::walked(rest, state);
+        };
+        // The answer goes to the new run: the run before keeps none.
+        let built = before.ahead().map(|mut ahead| std::mem::take(&mut *ahead));
+        let kept = match built {
+            Some(mut ahead) if !ahead.failed() => {
+                // The units that no query walked yet.
+                let units = ahead.rest();
+                if !ahead.is_whole() {
+                    self.walk_part(&mut ahead, units, cycle, state);
+                }
+                ahead.into_kept()
+            }
+            // A walk of the whole cycle is one unit.
+            Some(_) => self.keep_run(cycle, state).map(|kept| (kept, 1)),
+            None => None,
+        };
+        match kept {
+            Some((kept, units)) => Run::of(cycle, state, kept, units),
+            None => Run::refused(cycle, state),
+        }
+    }
+
+    /// Build a part of the answer of the cycle after `run`, in a query of
+    /// the run: an even share of the units that are left, for the queries
+    /// of this width that the run gets before the cycle begins.
+    fn walk_ahead(&self, run: &table::Run, state: &State) {
+        let (Some(cycle), Some(mut ahead)) = (run.cycle_ahead(), run.ahead()) else {
+            return;
+        };
+        if ahead.failed() || ahead.is_whole() {
+            return;
+        }
+        let span = state.span;
+        let left = span
+            .end
+            .checked_sub(span.begin)
+            .and_then(|width| {
+                run.span()
+                    .end
+                    .checked_sub(span.end)?
+                    .checked_div_floor(width)
+            })
+            .and_then(|left| usize::try_from(left).ok())
+            .unwrap_or(0);
+        let units = ahead.share(left);
+        self.walk_part(&mut ahead, units, cycle, state);
+    }
+
+    /// Walk `units` of this graph over `cycle` and add the answer to
+    /// `ahead`. A walk that gives no answer to keep fails `ahead`. While
+    /// another thread builds at this node, the units wait for a later
+    /// query.
+    fn walk_part(
+        &self,
+        ahead: &mut table::Ahead,
+        units: std::ops::Range<usize>,
+        cycle: TimeSpan,
+        state: &State,
+    ) {
+        let Some(_building) = Building::try_start(&self.node.building) else {
+            return;
+        };
+        let to = units.end;
+        let slice = Some((units, ahead.take_seen()));
+        // The walk writes after the haps of the walks before it.
+        let mut haps = ahead.take_haps();
+        match self.walk_for_run(&state.set_span(cycle), slice, &mut haps) {
+            Some((data_only, Some((met, seen)))) => ahead.add(haps, data_only, to, met, seen),
+            _ => ahead.fail(),
+        }
+    }
+
     /// The answer of `rest` to keep for a run of queries as `state`. `None`
     /// for an answer that is not made, because the walk throws, is refused
     /// or makes more haps than a run keeps, and for one that no query can
     /// be cut from. `None` also while another thread builds at this node.
     fn keep_run(&self, rest: TimeSpan, state: &State) -> Option<table::Kept> {
         let _building = Building::try_start(&self.node.building)?;
-        let asked = state.set_span(rest);
-        let ask = || self.answer_in(&asked, table::Order::Graph);
+        let mut haps = Vec::new();
+        let (data_only, _) = self.walk_for_run(&state.set_span(rest), None, &mut haps)?;
+        table::Kept::of(haps, data_only)
+    }
+
+    /// The answer of a walk of this graph over the span of `asked`, for a
+    /// run to keep, after the haps of `out`, and whether it holds data
+    /// only. With `slice`, the walk is a [`Slice`] of those units, with
+    /// the notes of the walks before it: the answer is of the units
+    /// alone, with how many units the walk met and the notes. `None` for
+    /// an answer that is not made, because the walk throws, is refused or
+    /// makes more haps than a run keeps, and for a slice that met another
+    /// graph than its notes say: `out` then holds what it held.
+    fn walk_for_run(
+        &self,
+        asked: &State,
+        slice: Option<(std::ops::Range<usize>, Vec<Seen>)>,
+        out: &mut Vec<Hap>,
+    ) -> Option<(bool, Option<Sliced>)> {
+        /// Ends the slice of the walk, also on unwind.
+        struct Whole;
+        impl Drop for Whole {
+            fn drop(&mut self) {
+                QUERY_THREAD.with(|thread| thread.slice_armed.set(0));
+            }
+        }
+        let sliced = slice.map(|(units, seen)| {
+            QUERY_THREAD.with(|thread| {
+                thread.slice.set(Slice {
+                    from: units.start,
+                    to: units.end,
+                    first: seen.is_empty(),
+                    ..Slice::NONE
+                });
+                SLICE_SEEN.with(|notes| notes.set(seen));
+                // The root is the next node that the walk visits.
+                thread.slice_armed.set(thread.depth.get() + 1);
+            });
+            Whole
+        });
+        let held = out.len();
+        // The walk writes after the haps that `out` holds.
+        let mut ask = || {
+            QUERY_THREAD.with(|thread| self.answer_onto(thread, asked, table::Order::Graph, out))
+        };
         let touches = uncacheable_touches();
         let answer = with_most_haps(table::Run::MOST_HAPS, || {
             without_query_signals(|| {
@@ -6671,13 +7073,28 @@ impl Pattern {
                 answer.filter(|_| !query_interrupted() && uncacheable_touches() == touches)
             })
         });
-        let Some((haps, data_only)) = answer else {
-            // What the walk of the rest contained is no failure of the
-            // query that asked for it.
-            clear_query_callback_failure();
-            return None;
+        let met = sliced.map(|_| {
+            let slice = QUERY_THREAD.with(|thread| thread.slice.get());
+            (slice, SLICE_SEEN.with(std::cell::Cell::take))
+        });
+        let whole = match (answer, met) {
+            (Some(data_only), Some((slice, seen))) if !slice.failed => {
+                Some((data_only, Some((slice.met, seen))))
+            }
+            (Some(data_only), None) => Some((data_only, None)),
+            (answer, _) => {
+                if answer.is_none() {
+                    // What the walk of the rest contained is no failure
+                    // of the query that asked for it.
+                    clear_query_callback_failure();
+                }
+                None
+            }
         };
-        table::Kept::of(haps, data_only)
+        if whole.is_none() {
+            out.truncate(held);
+        }
+        whole
     }
 
     /// Whether the root keeps the answer of a run now.
@@ -6953,13 +7370,26 @@ impl Pattern {
         if reads == SpanRead::No {
             return over_part(out);
         }
+        // A slice of a walk asks for a whole cycle. Where the part is that
+        // span, each way to ask is the same query: one visit of the
+        // pattern answers, and the slice skips what it does not ask for
+        // with no query of each layer.
+        if part == state.span && QUERY_THREAD.with(|thread| thread.slice_armed.get()) != 0 {
+            return over_span(out);
+        }
         match self.node_kind() {
             // A stack answers its layers one after the other, so each layer
             // is asked as its own haps allow. A handle that binds a runtime
             // or is marked volatile is asked as it is.
             Node::Stack(layers) if self.runtime_settings.is_none() && !self.is_volatile() => {
                 let from = out.len();
+                // No visit of the stack comes before the visits of its
+                // layers: a slice that is armed for it is armed for each.
+                let armed = QUERY_THREAD.with(|thread| thread.slice_armed.get());
                 for layer in layers.iter().filter(|layer| !layer.is_rest()) {
+                    if armed != 0 {
+                        QUERY_THREAD.with(|thread| thread.slice_armed.set(armed));
+                    }
                     stack_child_onto(out, |out| {
                         layer.query_restarted_onto(shift, state, part, out);
                     });
@@ -6974,9 +7404,15 @@ impl Pattern {
                 && QUERY_WALKED.with(std::cell::Cell::get) =>
             {
                 let from = out.len();
+                let armed = QUERY_THREAD.with(|thread| thread.slice_armed.get());
                 if asked_over_part(|| over_part(out)).is_none() {
-                    // What a refused query wrote is no answer.
+                    // What a refused query wrote is no answer. A walk
+                    // that asks a pattern two times is no slice: its
+                    // cycle is walked whole.
                     out.truncate(from);
+                    if armed != 0 {
+                        QUERY_THREAD.with(QueryThread::fail_slice);
+                    }
                     over_span(out);
                 }
             }
@@ -6989,17 +7425,22 @@ impl Pattern {
     fn query_faster_onto(
         &self,
         factor: Fraction,
+        grid: Option<&TempoGrid>,
         operation: &'static str,
         state: &State,
         out: &mut Vec<Hap>,
     ) {
+        if factor == Fraction::ONE {
+            return self.query_onto(state, out);
+        }
         let asked =
             state.with_span(|span| span.with_time(|t| fast_query_time(t, factor, operation)));
         let from = out.len();
         self.query_onto(&asked, out);
-        for hap in &mut out[from..] {
-            hap.map_times(|t| fast_hap_time(t, factor, operation));
-        }
+        Hap::map_times(&mut out[from..], asked.span, |t| {
+            grid.and_then(|grid| grid.time(t))
+                .unwrap_or_else(|| fast_hap_time(t, factor, operation))
+        });
     }
 
     /// The haps of this pattern, `by` later: what a [`Node::Shift`] over
@@ -7011,12 +7452,15 @@ impl Pattern {
         state: &State,
         out: &mut Vec<Hap>,
     ) {
+        if by == Fraction::ZERO {
+            return self.query_onto(state, out);
+        }
         let asked = state.with_span(|span| span.with_time(|t| shift_query_time(t, by, operation)));
         let from = out.len();
         self.query_onto(&asked, out);
-        for hap in &mut out[from..] {
-            hap.map_times(|t| shift_hap_time(t, by, operation));
-        }
+        Hap::map_times(&mut out[from..], asked.span, |t| {
+            shift_hap_time(t, by, operation)
+        });
     }
 
     /// Whether the graph is one of discrete haps: it answers for a part of
@@ -7179,13 +7623,9 @@ impl Pattern {
     }
 
     /// [`Self::query`] with the haps in `order`, and whether a table gave
-    /// the answer, so that it holds data only.
-    fn answer_in(&self, state: &State, order: table::Order) -> (Vec<Hap>, bool) {
-        self.answer_with_room(state, order, 0)
-    }
-
-    /// [`Self::answer_in`] in a list with room for `room` haps: the list of
-    /// the query of a caller, which takes most answers with no move.
+    /// the answer, so that it holds data only. The list has room for
+    /// `room` haps: it is the list of the query of a caller, which takes
+    /// most answers with no move.
     fn answer_with_room(
         &self,
         state: &State,
@@ -7198,8 +7638,8 @@ impl Pattern {
         (haps, data_only)
     }
 
-    /// [`Self::answer_in`] after the haps of `out`, on the counters of the
-    /// thread that asks, reached one time for the node.
+    /// [`Self::answer_with_room`] after the haps of `out`, on the counters
+    /// of the thread that asks, reached one time for the node.
     fn answer_onto(
         &self,
         thread: &QueryThread,
@@ -7301,7 +7741,10 @@ impl Pattern {
                 true
             }
             None => {
-                self.query_node_onto(state, out);
+                match thread.slice_armed.get() == depth {
+                    true => self.query_slice_onto(thread, depth, state, out),
+                    false => self.query_node_onto(state, out),
+                }
                 if order == table::Order::Sorted {
                     let haps = match from {
                         0 => std::mem::take(out),
@@ -7377,6 +7820,83 @@ impl Pattern {
         }
     }
 
+    /// [`Self::query_node_onto`] for a node at the depth that the
+    /// [`Slice`] of the walk is armed at. A stack arms the depth of each
+    /// child, and so does a node that hands on the haps of its one child.
+    /// A pick does so for the pattern that each hap of its selector picks.
+    /// The layers of a sequence are units, and a node of any other kind
+    /// is one unit: it answers when the slice asks for it. A node whose
+    /// answer met no unit is one unit too: a table may answer for a
+    /// child, with no visit of it.
+    fn query_slice_onto(
+        &self,
+        thread: &QueryThread,
+        depth: u32,
+        state: &State,
+        out: &mut Vec<Hap>,
+    ) {
+        let Some((first, note)) = thread.enter_slice(Arc::as_ptr(&self.node) as usize) else {
+            return;
+        };
+        let arm = || thread.slice_armed.set(depth + 1);
+        let held = out.len();
+        match self.node_kind() {
+            Node::Stack(pats) => query_stack_onto(pats, state, out, arm),
+            Node::Sequence(layers) => {
+                let units = thread.meet_units(layers.len());
+                sequence::query_sequence_onto(&layers[units], state, out);
+            }
+            Node::Pick {
+                selector,
+                lookup,
+                index_mode,
+                mode,
+            } => {
+                // The selector is asked with no slice. Each hap of it
+                // picks a pattern, which the slice goes on to: the picks
+                // answer one after the other.
+                thread.slice_armed.set(0);
+                query_pick(selector, lookup, *index_mode, *mode, state, out, &arm);
+            }
+            // Each of these asks its one child, or the side that gives
+            // its structure, before any other pattern, and makes its haps
+            // of each hap of the answer in turn.
+            Node::Cpm(..)
+            | Node::Fast(..)
+            | Node::Shift(..)
+            | Node::AddContext(..)
+            | Node::MapHapsNative(..)
+            | Node::MapHapsOwned(..)
+            | Node::FmapNative(..)
+            | Node::WithHapTime(..)
+            | Node::FilterValues(..)
+            | Node::FilterHaps(..)
+            | Node::Degrade(..)
+            | Node::Constants(..)
+            | Node::AppLeft(..) => {
+                arm();
+                self.query_node_onto(state, out);
+            }
+            // In one cycle, each of these asks one pattern one time, and
+            // moves its haps.
+            Node::SplitQueries(_) | Node::SlowCat(_) if state.span.within_one_cycle() => {
+                arm();
+                self.query_node_onto(state, out);
+            }
+            _ => {
+                if !thread.meet_units(1).is_empty() {
+                    self.query_node_onto(state, out);
+                }
+            }
+        }
+        // The node above arms the depth of its next child.
+        thread.slice_armed.set(0);
+        if thread.slice.get().met == first && thread.meet_units(1).is_empty() {
+            out.truncate(held);
+        }
+        thread.leave_slice(first, note);
+    }
+
     /// The haps of this node after those that `out` holds. A node of a
     /// kind that a walk meets often writes them there. A node of any other
     /// kind makes its list, and the list moves there.
@@ -7391,7 +7911,7 @@ impl Pattern {
             Node::Sequence(layers) => sequence::query_sequence_onto(layers, state, out),
 
             Node::Fast(pat, factor, operation) => {
-                pat.query_faster_onto(*factor, operation, state, out);
+                pat.query_faster_onto(*factor, None, operation, state, out);
             }
 
             Node::Shift(pat, by, operation) => pat.query_moved_onto(*by, operation, state, out),
@@ -7404,10 +7924,10 @@ impl Pattern {
                     .filter(|cps| cps.is_finite() && *cps > 0.0)
                     .unwrap_or(0.5);
                 // What `pat.fast(speed)` answers, with no node for it.
-                if let Some(speed) = rate.speed_at(scheduler_cps)
+                if let Some((speed, grid)) = rate.speed_at(scheduler_cps)
                     && speed.numer() != 0
                 {
-                    pat.query_faster_onto(speed, "fast", state, out);
+                    pat.query_faster_onto(speed, grid, "fast", state, out);
                 }
             }
 
@@ -7437,18 +7957,7 @@ impl Pattern {
                 });
             }
 
-            // Each child writes after the one before it. A child that
-            // fails writes nothing, and its siblings stay.
-            Node::Stack(pats) => {
-                let from = out.len();
-                for pat in pats.iter().filter(|pat| !pat.is_rest()) {
-                    stack_child_onto(out, |out| pat.query_onto(state, out));
-                    if !charge_held(out.len() - from) {
-                        out.truncate(from);
-                        return;
-                    }
-                }
-            }
+            Node::Stack(pats) => query_stack_onto(pats, state, out, || {}),
 
             Node::AddContext(pat, locs) => {
                 let from = out.len();
@@ -7491,7 +8000,7 @@ impl Pattern {
                 lookup,
                 index_mode,
                 mode,
-            } => query_pick(selector, lookup, *index_mode, *mode, state, out),
+            } => query_pick(selector, lookup, *index_mode, *mode, state, out, &|| {}),
 
             Node::Constants(base, run) => query_run(base, run, state, out),
 
@@ -14004,6 +14513,61 @@ mod restart_tests {
         fastcat((0..count).map(|n| note(f64::from(from + n))).collect())
     }
 
+    #[test]
+    fn cpm_keeps_exact_step_times_when_the_scheduler_tempo_changes() {
+        let source = stack(vec![steps(0, 16), steps(20, 3), crate::signal::saw()]);
+        for cpm in [32, 33] {
+            let tempo = source.cpm(whole(cpm)).mark_walked();
+            for (cps, denominator) in [(0.5, 30), (0.75, 45), (0.5, 30)] {
+                let speed = Fraction::new(cpm, denominator);
+                let walked = source
+                    .with_query_time(move |t| t * speed)
+                    .with_hap_time(move |t| t / speed)
+                    .mark_walked();
+                for tick in -24..48 {
+                    for width in [0, 1, 5, 11] {
+                        let span =
+                            TimeSpan::new(Fraction::new(tick, 13), Fraction::new(tick + width, 13));
+                        let mut state = State::new(span);
+                        state.controls.insert("_cps".into(), Value::F64(cps));
+                        assert_eq!(
+                            format!("{:?}", tempo.query(&state)),
+                            format!("{:?}", walked.query(&state)),
+                            "{span:?} at {cpm} cpm and {cps} cps"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn speed_and_shift_restore_shared_edges_of_cut_haps() {
+        let source = stack(vec![steps(0, 4), steps(10, 3), crate::signal::saw()]);
+        for speed in [Fraction::ONE, Fraction::new(11, 10), Fraction::new(2, 3)] {
+            for shift in [Fraction::ZERO, whole(-2), Fraction::new(3, 5)] {
+                let mapped = source.late(shift).fast(speed).mark_walked();
+                let walked = source
+                    .with_query_time(move |t| t - shift)
+                    .with_hap_time(move |t| t + shift)
+                    .with_query_time(move |t| t * speed)
+                    .with_hap_time(move |t| t / speed)
+                    .mark_walked();
+                for tick in -16..32 {
+                    for width in [0, 1, 5, 13] {
+                        let begin = Fraction::new(tick, 8);
+                        let end = Fraction::new(tick + width, 8);
+                        assert_eq!(
+                            format!("{:?}", mapped.query_arc(begin, end)),
+                            format!("{:?}", walked.query_arc(begin, end)),
+                            "{begin:?}..{end:?} at {speed:?} shifted by {shift:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// Sections of discrete haps: steps, stacks, alternations, structures,
     /// speed changes, a coin and controls, with a signal as the value of one.
     fn discrete_sections() -> Vec<Pattern> {
@@ -14063,6 +14627,73 @@ mod restart_tests {
     /// know the map, so it asks such a section over the span of the query.
     fn asked_over_the_span(section: Pattern) -> Pattern {
         section.with_query_time(|time| time)
+    }
+
+    #[test]
+    fn restarted_sequence_steps_keep_their_parts_and_clip_their_wholes() {
+        let section = || {
+            let at = |n| Fraction::new(n, 8);
+            let step = SequenceStep::new(at(0), at(8), Value::F64(1.0), vec![(2, 5)].into());
+            sequence(vec![SequenceLayer {
+                period: whole(2),
+                steps: vec![
+                    step.placed((at(0), at(6)), (at(1), at(4))),
+                    step.placed((at(3), at(8)), (at(4), at(7))),
+                ],
+            }])
+            .expect("ordered steps")
+        };
+        for mode in [JoinMode::Reset, JoinMode::Restart] {
+            let pick = |choice| picked(mode, vec![choice], third(4)).mark_walked();
+            let direct = pick(section());
+            let graph = pick(asked_over_the_span(section()));
+            for start in -36..36 {
+                for width in [0, 1, 3, 9, 19] {
+                    let state = State::new(TimeSpan::new(
+                        Fraction::new(start, 9),
+                        Fraction::new(start + width, 9),
+                    ));
+                    assert_eq!(
+                        format!("{:?}", direct.query(&state)),
+                        format!("{:?}", graph.query(&state)),
+                        "{mode:?} at {start}/9 for {width}/9"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_restart_repeats_every_layer_only_at_a_shared_period() {
+        let section = || {
+            let layer = |period, value| SequenceLayer {
+                period,
+                steps: vec![SequenceStep::new(
+                    Fraction::ZERO,
+                    third(2),
+                    Value::F64(value),
+                    Locations::new(),
+                )],
+            };
+            sequence(vec![layer(whole(2), 1.0), layer(third(2), 2.0)])
+                .expect("two layers of different periods")
+        };
+        for cycles in [whole(2), whole(3), third(5)] {
+            let pick = |choice| picked(JoinMode::Restart, vec![choice], cycles).mark_walked();
+            let repeated = pick(section());
+            let moved = pick(asked_over_the_span(section()));
+            for tick in -30..45 {
+                for width in [0, 1, 4, 13] {
+                    let span = TimeSpan::new(third(tick), third(tick + width));
+                    let state = State::new(span);
+                    assert_eq!(
+                        format!("{:?}", repeated.query(&state)),
+                        format!("{:?}", moved.query(&state)),
+                        "{span:?} with a restart every {cycles:?} cycles"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -14315,6 +14946,46 @@ mod restart_tests {
         ]
     }
 
+    /// The parts of the walk of a cycle, one after the other, are the
+    /// answer of the walk, for parts of one unit and of three: the same
+    /// haps in the same order. A later part goes under no node whose
+    /// units it does not ask for, and a song of sections is more units
+    /// than one.
+    #[test]
+    fn the_parts_of_a_walk_are_its_answer_in_order() {
+        let mut most = 0;
+        for (name, song) in songs() {
+            let song = song.mark_walked();
+            for cycle in [0, 3, 7, 12] {
+                let state = State::new(TimeSpan::new(whole(cycle), whole(cycle + 1)));
+                let mut walk = Vec::new();
+                if song.walk_for_run(&state, None, &mut walk).is_none() {
+                    continue;
+                }
+                for share in [1, 3] {
+                    let (mut parts, mut seen, mut from) = (Vec::new(), Vec::new(), 0);
+                    loop {
+                        let slice = Some((from..from + share, seen));
+                        let (_, met) = song
+                            .walk_for_run(&state, slice, &mut parts)
+                            .expect("a part of a walk that answers");
+                        let (units, notes) = met.expect("a slice says what it met");
+                        (seen, from, most) = (notes, from + share, most.max(units));
+                        if from >= units {
+                            break;
+                        }
+                    }
+                    assert_eq!(
+                        format!("{parts:?}"),
+                        format!("{walk:?}"),
+                        "{name} in cycle {cycle}, {share} units a part"
+                    );
+                }
+            }
+        }
+        assert!(most > 3, "the largest song is {most} units");
+    }
+
     #[test]
     fn a_run_of_short_queries_is_cut_from_one_answer_of_the_rest_of_the_cycle() {
         let widths = [Fraction::new(1, 8), Fraction::new(5, 48), third(1)];
@@ -14329,19 +15000,23 @@ mod restart_tests {
                     State::new(TimeSpan::new(Fraction::ZERO, Fraction::ONE)),
                     tempo(0.75),
                 ] {
-                    let song = || songs().swap_remove(index).1.mark_walked();
-                    let run = song();
-                    let mut kept = false;
-                    for span in in_a_row(third(-4), width, 60) {
-                        // A new graph answers its first query with a walk.
-                        assert_eq!(
-                            asked(&run, span, &state),
-                            asked(&song(), span, &state),
-                            "{name} over {span:?}"
-                        );
-                        kept |= run.keeps_run();
+                    // A run whose queries cross into each cycle, and one
+                    // whose queries begin with each cycle.
+                    for start in [third(-4), Fraction::ZERO] {
+                        let song = || songs().swap_remove(index).1.mark_walked();
+                        let run = song();
+                        let mut kept = false;
+                        for span in in_a_row(start, width, 60) {
+                            // A new graph answers its first query with a walk.
+                            assert_eq!(
+                                asked(&run, span, &state),
+                                asked(&song(), span, &state),
+                                "{name} over {span:?}"
+                            );
+                            kept |= run.keeps_run();
+                        }
+                        assert!(kept, "{name} keeps an answer for spans of {width:?}");
                     }
-                    assert!(kept, "{name} keeps an answer for spans of {width:?}");
                 }
             }
         }
@@ -14503,26 +15178,40 @@ mod restart_tests {
             let walked = song().query_arc_outcome_with_budget(&state, DEFAULT_HAP_BUDGET);
             assert_eq!(format!("{answer:?}"), format!("{walked:?}"), "{span:?}");
         };
-        same(eighth(0), &state);
-        same(eighth(1), &state);
+        // The graph answers the first cycle of a run, and its queries
+        // build the answer of the second one.
+        for at in 0..8 {
+            same(eighth(at), &state);
+            assert!(!run.keeps_run());
+        }
+        same(eighth(8), &state);
         assert!(run.keeps_run());
         // A query somewhere else, and one at another tempo.
         once(eighth(40), &state);
         assert!(run.keeps_run());
-        once(eighth(2), &state);
-        once(eighth(3), &ahead);
+        once(eighth(9), &state);
+        once(eighth(10), &ahead);
         assert!(run.keeps_run());
-        once(eighth(3), &state);
+        once(eighth(10), &state);
         // Two in a row end the run, and the second one begins another.
-        once(eighth(4), &ahead);
-        once(eighth(5), &ahead);
+        once(eighth(11), &ahead);
+        once(eighth(12), &ahead);
         assert!(!run.keeps_run());
-        once(eighth(6), &ahead);
+        for at in 13..16 {
+            once(eighth(at), &ahead);
+            assert!(!run.keeps_run());
+        }
+        once(eighth(16), &ahead);
         assert!(run.keeps_run());
-        // The last query of the rest of the cycle frees the answer.
-        once(eighth(7), &ahead);
+        // The last query of the cycle frees the answer, and the next one
+        // keeps the answer that the queries of the cycle built.
+        for at in 17..23 {
+            once(eighth(at), &ahead);
+        }
+        assert!(run.keeps_run());
+        once(eighth(23), &ahead);
         assert!(!run.keeps_run());
-        once(eighth(8), &ahead);
+        once(eighth(24), &ahead);
         assert!(run.keeps_run());
     }
 
