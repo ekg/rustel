@@ -430,8 +430,8 @@ placeholders are replaced first:
 | Placeholder | Replaced with |
 | --- | --- |
 | `{prompt}` | the prompt you typed |
-| `{set}` | the set folder the pod runs in |
-| `{file}` | the open score's path |
+| `{set}` | the set folder the pod runs in, as an absolute path |
+| `{file}` | the open score's absolute path |
 
 A template that names `{file}` refuses to run while no score is open - a tape
 or a replay has no file to hand the pod.

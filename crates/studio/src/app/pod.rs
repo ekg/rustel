@@ -6,8 +6,10 @@
 //! a template in Settings ▸ Live coding - `my-agent --prompt {prompt}
 //! {file}` - and the pod prompt is one line of text over the studio.
 //! Submitting it spawns the command with the set folder as its working
-//! directory, so a relative `{file}` or a pod that writes beside itself
-//! lands in the set. No shell stands between the studio and the program:
+//! directory, so a pod that writes beside itself lands in the set.
+//! `{set}` and `{file}` are handed as absolute paths, so they name the
+//! same folders and files whatever directory the pod reads them from.
+//! No shell stands between the studio and the program:
 //! the template is split on whitespace into `Command` arguments, and
 //! nothing in it is quoted, escaped or expanded by anything else.
 //!
@@ -579,12 +581,16 @@ impl App {
             self.dirty_frame = true;
             return;
         }
-        let set = self.scenes.directory().to_path_buf();
-        let file = self
-            .scenes
-            .current()
-            .is_score()
-            .then(|| self.scenes.current().path.clone());
+        // The set and the score keep the spelling they were opened with,
+        // which can be relative to the studio's own cwd. The pod runs with
+        // the set folder as its cwd, so that spelling would resolve
+        // against the wrong directory. Hand it the same paths, absolute.
+        let set = std::path::absolute(self.scenes.directory())
+            .unwrap_or_else(|_| self.scenes.directory().to_path_buf());
+        let file = self.scenes.current().is_score().then(|| {
+            std::path::absolute(&self.scenes.current().path)
+                .unwrap_or_else(|_| self.scenes.current().path.clone())
+        });
         if template.contains("{file}") && file.is_none() {
             self.status = "the pod command names {file} but no score is open".into();
             self.dirty_frame = true;
@@ -722,6 +728,25 @@ mod tests {
         /// convention: the process tests are the only ones that need it.
         fn has(binary: &str) -> bool {
             std::path::Path::new(binary).exists()
+        }
+
+        /// Runs the test body from `dir` and puts the process working
+        /// directory back on the way out, even through a panic, so the
+        /// one relative-path test cannot move the rest of the suite.
+        struct CurrentDir(std::path::PathBuf);
+
+        impl CurrentDir {
+            fn enter(dir: &std::path::Path) -> Self {
+                let former = std::env::current_dir().expect("the working directory");
+                std::env::set_current_dir(dir).expect("move to the folder");
+                Self(former)
+            }
+        }
+
+        impl Drop for CurrentDir {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(&self.0);
+            }
         }
 
         #[test]
@@ -1054,6 +1079,46 @@ mod tests {
                 app.status.contains("finished"),
                 "the footer says how it ended: {}",
                 app.status
+            );
+        }
+
+        /// A set opened by a relative path hands the pod absolute `{set}`
+        /// and `{file}` anyway: the pod runs with the set folder as its
+        /// working directory, so the relative spelling the studio was
+        /// started with would resolve against the set folder instead of
+        /// the folder the studio opened.
+        #[cfg(unix)]
+        #[test]
+        fn a_relative_set_hands_the_pod_absolute_paths() {
+            if !has("/bin/echo") {
+                return;
+            }
+            let parent = tempfile::tempdir().expect("temp dir");
+            std::fs::create_dir(parent.path().join("set")).expect("the set folder");
+            let _dir = CurrentDir::enter(parent.path());
+            let (mut app, _) = plain_app(std::path::Path::new("set"), "$: s(\"bd\")\n");
+            assert!(
+                app.scenes.directory().is_relative(),
+                "the fixture must open the set by a relative path"
+            );
+            app.ui_settings.pod_command = "/bin/echo {set} {file}".into();
+            app.open_pod_prompt(PodPromptKind::Request);
+            type_text(&mut app, "go");
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            for _ in 0..100 {
+                app.pump_pod();
+                if app.pod_run.is_none() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(app.pod_run.is_none(), "the pod was never reaped");
+            let set = parent.path().join("set");
+            let line = format!("{} {}", set.display(), set.join("first.strudel").display());
+            let lines = pod_lines(&app);
+            assert!(
+                lines.iter().any(|said| said.contains(&line)),
+                "the pod said the absolute paths, not the relative spelling: {lines:?}"
             );
         }
 
