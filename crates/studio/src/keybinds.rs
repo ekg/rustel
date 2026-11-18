@@ -102,7 +102,7 @@ pub enum BindAction {
     ToggleComment,
     /// Find text in the focused score.
     Find,
-    /// Open the pod prompt: hand a prompt to the configured pod command.
+    /// Open the pod prompt: hand a prompt to the configured pod.
     PodPrompt,
     FirstError,
     // Scenes

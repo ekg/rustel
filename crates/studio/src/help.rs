@@ -542,7 +542,7 @@ fn shortcut_rows_with_keybinds(
                     pod
                 }
             },
-            "pod prompt: send a prompt to the configured pod command, which rewrites the score",
+            "pod prompt: send a prompt to the configured pod - command, llm or agent - which rewrites the score",
         ),
         HelpRow::new(hint(BindAction::Docs), "docs for the function at the caret"),
         HelpRow::new(

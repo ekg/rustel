@@ -8,7 +8,17 @@
 //! - `llm` makes one chat call to an OpenAI-compatible endpoint (the
 //!   `rustel-pod-llm` crate) with the active tab's score and the prompt,
 //!   and the reply replaces the score.
-//! - `agent` is not built yet; the prompt refuses while it is chosen.
+//! - `agent` runs a persistent agent process: the command line the
+//!   `agent command` row names (the default is `pi --mode rpc
+//!   --no-session`), speaking the RPC protocol - one JSON object per
+//!   line, commands on its stdin, responses and events on its stdout.
+//!   One process stays alive across prompts, which is the whole point:
+//!   every prompt lands in the same conversation, so the agent keeps
+//!   the context it built - the score, the earlier changes, what it
+//!   said about them. A prompt is one `prompt` command under an id of
+//!   its own; the agent's text deltas and tool narration stream into
+//!   the log while it works, and the prompt is done when the agent
+//!   settles.
 //!
 //! The command pod is any command that takes a prompt and writes score
 //! files. The template - `my-agent --prompt {prompt} {file}` - runs with
@@ -22,14 +32,17 @@
 //!
 //! What the command pod writes, the [external changes
 //! watch](external_changes.rs) follows: `sync` takes the saved text into
-//! the editor, and `sync & eval` plays it. The llm pod needs no watch:
-//! the studio itself wrote what it adopted, so the reply goes into the
-//! tab it came from, its file takes it, and it is evaluated like an
-//! update - the studio-internal path, whatever the watch row says. The
-//! llm pod's request is the core crate's system prompt, the active tab's
-//! current score, and the player's prompt; a failure keeps the editor
-//! untouched and lands in the log under `pod`, its message naming the
-//! kind of failure.
+//! the editor, and `sync & eval` plays it. The agent pod writes score
+//! files the same way - with its own file tools, from the set folder it
+//! runs in - so the same watch (or the player's own update key) applies
+//! what it saves; the pane owns no copy of the agent's answer. The llm
+//! pod needs no watch: the studio itself wrote what it adopted, so the
+//! reply goes into the tab it came from, its file takes it, and it is
+//! evaluated like an update - the studio-internal path, whatever the
+//! watch row says. The llm pod's request is the core crate's system
+//! prompt, the active tab's current score, and the player's prompt; a
+//! failure keeps the editor untouched and lands in the log under `pod`,
+//! its message naming the kind of failure.
 //!
 //! A pod's own words - the command's streams, each line as it completes -
 //! go to the log under `pod` through the same bounded capture, and a
@@ -40,8 +53,13 @@
 //! the score while it works, and two of them writing one file is a race
 //! nobody asked for. Cancellation is not offered for the same reason -
 //! killing a pod mid-write leaves a half-written score, which is the
-//! worse way to lose one. A pod that outlives the studio keeps running:
-//! nothing kills it on the way out.
+//! worse way to lose one. A command pod that outlives the studio keeps
+//! running: nothing kills it on the way out. The agent is the one pod
+//! that does not outlive the studio: it dies with it, on the same
+//! orderly shutdown the RPC protocol itself uses. A dead or crashed
+//! agent is said in the log, and the next submit spawns a fresh one -
+//! with a fresh context to build, which is the cost of the crash, not
+//! of the design. One agent process exists at a time.
 //!
 //! The llm key is a settings row or the `RUSTEL_LLM_KEY` environment
 //! variable; the environment wins, for players who would rather not
@@ -90,6 +108,14 @@ const MAX_COMMAND_CHARS: usize = 500;
 /// than the command template's bound.
 const MAX_CONFIG_CHARS: usize = 2000;
 
+/// How long the agent's own orderly exit is waited for when the studio
+/// shuts it down, and how often it is looked for. Closing stdin is the
+/// RPC protocol's own way down, so that goes first and the agent gets a
+/// moment to finish its writes; what is still up after this is killed,
+/// because the studio will not be reading whatever it writes next.
+const AGENT_EXIT_WAIT: Duration = Duration::from_secs(2);
+const AGENT_EXIT_POLL: Duration = Duration::from_millis(20);
+
 /// What the one pod prompt is asking for.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum PodPromptKind {
@@ -103,6 +129,9 @@ pub(super) enum PodPromptKind {
     Model,
     /// The llm key row's API key, from Enter on its settings row.
     Key,
+    /// The agent command row's command line, from Enter on its settings
+    /// row.
+    AgentCommand,
 }
 
 impl PodPromptKind {
@@ -114,6 +143,7 @@ impl PodPromptKind {
             Self::Endpoint => " llm endpoint ",
             Self::Model => " llm model ",
             Self::Key => " llm key ",
+            Self::AgentCommand => " agent command ",
         }
     }
 
@@ -127,6 +157,7 @@ impl PodPromptKind {
             Self::Endpoint => Some("llm endpoint"),
             Self::Model => Some("llm model"),
             Self::Key => Some("llm key"),
+            Self::AgentCommand => Some("agent command"),
         }
     }
 
@@ -134,7 +165,7 @@ impl PodPromptKind {
     fn char_limit(self) -> usize {
         match self {
             Self::Request => MAX_REQUEST_CHARS,
-            Self::Command => MAX_COMMAND_CHARS,
+            Self::Command | Self::AgentCommand => MAX_COMMAND_CHARS,
             Self::Endpoint | Self::Model | Self::Key => MAX_CONFIG_CHARS,
         }
     }
@@ -261,8 +292,9 @@ fn request_refusal(settings: &UiSettings) -> Option<String> {
             "no llm key is set \u{b7} Settings \u{25b8} Live coding \u{25b8} llm key \u{b7} or the RUSTEL_LLM_KEY environment variable"
                 .into(),
         ),
-        // One arm, for the real agent pod to take over.
-        PodKind::Agent => Some("agent pods are not built yet \u{b7} use command or llm".into()),
+        PodKind::Agent if settings.agent_command.trim().is_empty() => Some(
+            "no agent command is set \u{b7} Settings \u{25b8} Live coding \u{25b8} agent command".into(),
+        ),
         _ => None,
     }
 }
@@ -339,6 +371,97 @@ enum PodBody {
         outcome: std::sync::mpsc::Receiver<LlmOutcome>,
         scene: SceneId,
     },
+    /// An agent prompt in flight: the id its `prompt` command went out
+    /// under, and the answer's last line still waiting for its newline.
+    /// The process, its stdin and its feed live in [`App::pod_agent`],
+    /// which outlives the prompt.
+    Agent { id: String, pending: String },
+}
+
+/// One line from the agent's two pipes: a protocol record off its
+/// stdout, or a line of its own diagnostics off its stderr - which the
+/// RPC protocol keeps for exactly that, and the log takes the way it
+/// takes a command pod's stderr.
+enum AgentFeed {
+    Record(String),
+    Diagnostics(String),
+}
+
+/// The agent pod's process: one agent, kept alive across prompts so its
+/// context accumulates. A prompt in flight is a [`PodRun`] like any
+/// pod's; this is the process underneath, which outlives it.
+pub(super) struct AgentPod {
+    /// The program as the log and the footer name it: the command line's
+    /// first word.
+    pub(super) program: String,
+    /// The agent's stdin: every RPC command goes here as one JSON object
+    /// per line. Taken (closed) on the way down.
+    stdin: Option<std::process::ChildStdin>,
+    /// The agent's records and diagnostics, from the reader threads.
+    feed: std::sync::mpsc::Receiver<AgentFeed>,
+    child: Child,
+    /// One past the last prompt id handed out. Ids begin at `pod-1` and
+    /// correlate each prompt with the response that answers it.
+    next_id: u64,
+}
+
+impl AgentPod {
+    /// The next prompt's command: its id, and the line as it goes out.
+    /// One JSON object per line is the protocol's whole framing.
+    fn prompt_line(&mut self, message: &str) -> (String, String) {
+        let id = format!("pod-{}", self.next_id);
+        self.next_id += 1;
+        let line = serde_json::json!({
+            "id": id,
+            "type": "prompt",
+            "message": message,
+        })
+        .to_string();
+        (id, line)
+    }
+
+    /// Send one command line. A broken pipe here means the agent is
+    /// gone; the caller says so, and the next submit spawns a fresh one.
+    fn send(&mut self, line: &str) -> std::io::Result<()> {
+        use std::io::Write as _;
+        let Some(stdin) = self.stdin.as_mut() else {
+            return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+        };
+        stdin.write_all(line.as_bytes())?;
+        stdin.write_all(b"\n")?;
+        stdin.flush()
+    }
+
+    /// How the process ended, if it already has: for the log line that
+    /// says the agent is gone.
+    fn how_it_ended(&mut self) -> Option<String> {
+        self.child
+            .try_wait()
+            .ok()
+            .flatten()
+            .map(|status| status.to_string())
+    }
+}
+
+impl Drop for AgentPod {
+    /// The agent dies with the studio. Closing stdin is the RPC
+    /// protocol's own orderly shutdown, so it goes first and the agent
+    /// gets [`AGENT_EXIT_WAIT`] to finish its writes; what is still up
+    /// after that is killed, mid-write or not, because the studio will
+    /// not be reading whatever it writes next.
+    fn drop(&mut self) {
+        self.stdin.take();
+        let deadline = Instant::now() + AGENT_EXIT_WAIT;
+        while Instant::now() < deadline {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => std::thread::sleep(AGENT_EXIT_POLL),
+                Err(_) => break,
+            }
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 /// What the llm pod's thread sends back: the rewritten score, or the
@@ -385,7 +508,18 @@ pub(super) fn render_prompt(frame: &mut ratatui::Frame<'_>, theme: &Theme, promp
 /// completes. A line longer than [`CAPTURE_LINE_MAX`] is sent as its head
 /// with an ellipsis; the rest of it is read away rather than kept, so no
 /// pod can cost the studio the memory of one enormous answer.
-fn forward_stream<R: std::io::Read>(mut reader: R, sender: std::sync::mpsc::SyncSender<String>) {
+fn forward_stream<R: std::io::Read>(reader: R, sender: std::sync::mpsc::SyncSender<String>) {
+    forward_tagged_stream(reader, sender, |line| line)
+}
+
+/// The same reader with each line tagged on its way out, so one queue
+/// can carry an agent's protocol records and its stderr diagnostics
+/// apart.
+fn forward_tagged_stream<R, T, F>(mut reader: R, sender: std::sync::mpsc::SyncSender<T>, tag: F)
+where
+    R: std::io::Read,
+    F: Fn(String) -> T,
+{
     let mut pending: Vec<u8> = Vec::new();
     // The tail of a line whose head was already sent: read away, unsent.
     let mut discarding = false;
@@ -400,14 +534,14 @@ fn forward_stream<R: std::io::Read>(mut reader: R, sender: std::sync::mpsc::Sync
             }
             if at > CAPTURE_LINE_MAX {
                 let head: Vec<u8> = pending.drain(..CAPTURE_LINE_MAX).collect();
-                if send_line(&sender, head, true).is_err() {
+                if send_line(&sender, head, true, &tag).is_err() {
                     return;
                 }
                 pending.drain(..=at - CAPTURE_LINE_MAX);
                 continue;
             }
             let line: Vec<u8> = pending.drain(..=at).collect();
-            if send_line(&sender, line, false).is_err() {
+            if send_line(&sender, line, false, &tag).is_err() {
                 // The studio is gone; the pipe is closed behind it anyway.
                 return;
             }
@@ -419,7 +553,7 @@ fn forward_stream<R: std::io::Read>(mut reader: R, sender: std::sync::mpsc::Sync
         // longer one is cut.
         if !discarding && pending.len() > CAPTURE_LINE_MAX {
             let head: Vec<u8> = pending.drain(..CAPTURE_LINE_MAX).collect();
-            if send_line(&sender, head, true).is_err() {
+            if send_line(&sender, head, true, &tag).is_err() {
                 return;
             }
             discarding = true;
@@ -434,7 +568,7 @@ fn forward_stream<R: std::io::Read>(mut reader: R, sender: std::sync::mpsc::Sync
             // own is still a line.
             Ok(0) | Err(_) => {
                 if !discarding && !pending.is_empty() {
-                    let _ = send_line(&sender, pending, false);
+                    let _ = send_line(&sender, pending, false, &tag);
                 }
                 return;
             }
@@ -443,12 +577,17 @@ fn forward_stream<R: std::io::Read>(mut reader: R, sender: std::sync::mpsc::Sync
     }
 }
 
-/// One line as one event, without its newline, marked when it was cut.
-fn send_line(
-    sender: &std::sync::mpsc::SyncSender<String>,
+/// One line as one event, without its newline, tagged for its queue and
+/// marked when it was cut.
+fn send_line<T, F>(
+    sender: &std::sync::mpsc::SyncSender<T>,
     mut bytes: Vec<u8>,
     cut: bool,
-) -> Result<(), std::sync::mpsc::SendError<()>> {
+    tag: &F,
+) -> Result<(), std::sync::mpsc::SendError<()>>
+where
+    F: Fn(String) -> T,
+{
     while matches!(bytes.last(), Some(b'\n') | Some(b'\r')) {
         bytes.pop();
     }
@@ -457,7 +596,7 @@ fn send_line(
         line.push_str(" \u{2026}");
     }
     sender
-        .send(line)
+        .send(tag(line))
         .map_err(|_| std::sync::mpsc::SendError(()))
 }
 
@@ -481,6 +620,7 @@ impl App {
         }
         let text = match kind {
             PodPromptKind::Command => self.ui_settings.pod_command.clone(),
+            PodPromptKind::AgentCommand => self.ui_settings.agent_command.clone(),
             PodPromptKind::Endpoint => self.ui_settings.llm_endpoint.clone(),
             PodPromptKind::Model => self.ui_settings.llm_model.clone(),
             PodPromptKind::Key => self.ui_settings.llm_api_key.clone(),
@@ -507,9 +647,14 @@ impl App {
                     "pod - type a prompt \u{b7} Enter asks {} \u{b7} Esc closes",
                     self.ui_settings.llm_model.trim()
                 ),
-                // Unreachable: the agent rung is refused before the prompt
-                // opens. One arm, for the real agent pod to take over.
-                PodKind::Agent => "agent pods are not built yet".into(),
+                PodKind::Agent => format!(
+                    "pod - type a prompt \u{b7} Enter asks {} \u{b7} Esc closes",
+                    self.ui_settings
+                        .agent_command
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("the agent")
+                ),
             },
             PodPromptKind::Command => {
                 "pod command - {prompt} {set} {file} are replaced \u{b7} Enter keeps \u{b7} Esc closes"
@@ -524,6 +669,10 @@ impl App {
             }
             PodPromptKind::Key => {
                 "llm key - Enter keeps \u{b7} RUSTEL_LLM_KEY in the environment wins over it \u{b7} Esc closes"
+                    .into()
+            }
+            PodPromptKind::AgentCommand => {
+                "agent command - the RPC process one prompt after another goes to \u{b7} Enter keeps \u{b7} Esc closes"
                     .into()
             }
         };
@@ -694,13 +843,9 @@ impl App {
             // The command-template pod, untouched by the llm rows.
             PodKind::Command => self.launch_pod(prompt),
             PodKind::Llm => self.launch_llm_pod(prompt),
-            // Not built yet. One arm, for the real agent pod to take
-            // over; the prompt is refused before it opens, and this arm
-            // is the same refusal for whatever path reaches it anyway.
-            PodKind::Agent => {
-                self.status = "agent pods are not built yet \u{b7} use command or llm".into();
-                self.dirty_frame = true;
-            }
+            // The persistent agent: one process, the prompt one RPC
+            // command in its life.
+            PodKind::Agent => self.launch_agent_pod(prompt),
         }
     }
 
@@ -714,6 +859,7 @@ impl App {
         let text = prompt.text.trim().to_owned();
         match prompt.kind {
             PodPromptKind::Command => self.ui_settings.pod_command = text.clone(),
+            PodPromptKind::AgentCommand => self.ui_settings.agent_command = text.clone(),
             PodPromptKind::Endpoint => self.ui_settings.llm_endpoint = text.clone(),
             PodPromptKind::Model => self.ui_settings.llm_model = text.clone(),
             PodPromptKind::Key => self.ui_settings.llm_api_key = text.clone(),
@@ -730,10 +876,14 @@ impl App {
                 "llm key kept \u{b7} the preferences file keeps it as plain text".into()
             }
         } else if text.is_empty() {
-            if prompt.kind == PodPromptKind::Command {
-                "pod command cleared \u{b7} the pod prompt is hidden until one is set".into()
-            } else {
-                format!("{name} cleared")
+            match prompt.kind {
+                PodPromptKind::Command => {
+                    "pod command cleared \u{b7} the pod prompt is hidden until one is set".into()
+                }
+                PodPromptKind::AgentCommand => {
+                    "agent command cleared \u{b7} agent pods are refused until one is set".into()
+                }
+                _ => format!("{name} cleared"),
             }
         } else {
             format!("{name} kept \u{b7} {text}")
@@ -888,13 +1038,167 @@ impl App {
         }
     }
 
+    /// Start the agent pod: one process, spawned if none is alive, and
+    /// the prompt sent to it as one RPC `prompt` command under an id of
+    /// its own. The agent's answer streams into the log through
+    /// [`App::pump_pod`], the way a command pod's lines do; the prompt
+    /// is done when the agent settles, and the process stays alive for
+    /// the next one.
+    fn launch_agent_pod(&mut self, prompt: &str) {
+        if self.pod_run.is_some() {
+            self.status = "a pod is already running \u{b7} its output is in the log".into();
+            self.dirty_frame = true;
+            return;
+        }
+        let template = self.ui_settings.agent_command.trim().to_owned();
+        if template.is_empty() {
+            self.status =
+                "no agent command is set \u{b7} Settings \u{25b8} Live coding \u{25b8} agent command".into();
+            self.dirty_frame = true;
+            return;
+        }
+        // One agent process at a time: a living one takes the prompt as
+        // it stands, and a dead one was already taken away and said by
+        // the turn loop, so what is left here is the first prompt of the
+        // night.
+        if self.pod_agent.is_none()
+            && let Err(error) = self.spawn_agent(&template)
+        {
+            let program = template.split_whitespace().next().unwrap_or("the agent");
+            self.log.push(
+                LogLevel::Warn,
+                "pod",
+                format!("could not start {program}: {error}"),
+            );
+            self.status = format!("could not start the agent: {error}");
+            self.dirty_frame = true;
+            return;
+        }
+        let Some(agent) = self.pod_agent.as_mut() else {
+            return;
+        };
+        let (id, line) = agent.prompt_line(prompt);
+        let sent = agent.send(&line);
+        let program = agent.program.clone();
+        match sent {
+            Ok(()) => {
+                self.pod_run = Some(PodRun {
+                    program: program.clone(),
+                    body: PodBody::Agent {
+                        id,
+                        pending: String::new(),
+                    },
+                    capture: Capture::default(),
+                });
+                self.log.push(
+                    LogLevel::Info,
+                    "pod",
+                    format!("sent the prompt to {program}"),
+                );
+                self.status = format!("pod running \u{b7} {program} is on it");
+                self.dirty_frame = true;
+            }
+            Err(error) => {
+                // The pipe was already broken: the agent went between the
+                // turn loop's last look and this submit. Take it away and
+                // say so - the next submit spawns a fresh one.
+                let how = self.agent_gone();
+                self.log.push(
+                    LogLevel::Warn,
+                    "pod",
+                    format!("the prompt never reached {program}: the agent {how} ({error})"),
+                );
+                self.status = format!("the agent {how} \u{b7} submit the prompt again");
+                self.dirty_frame = true;
+            }
+        }
+    }
+
+    /// Spawn the agent: one process that stays alive across prompts,
+    /// speaking the RPC protocol - one JSON object per line, commands
+    /// on stdin, responses and events on stdout - with the set folder as
+    /// its working directory, so its own file tools land in the set.
+    /// No shell and no placeholders: the template is the command line,
+    /// and the prompt travels in the protocol, not in the arguments.
+    fn spawn_agent(&mut self, template: &str) -> Result<(), String> {
+        let arguments: Vec<String> = template.split_whitespace().map(str::to_owned).collect();
+        let program = arguments.first().cloned().unwrap_or_default();
+        // The set keeps the spelling it was opened with, which can be
+        // relative to the studio's own cwd; the agent's working
+        // directory needs the absolute one, the way the command pod's
+        // does.
+        let set = std::path::absolute(self.scenes.directory())
+            .unwrap_or_else(|_| self.scenes.directory().to_path_buf());
+        let spawn = std::process::Command::new(&program)
+            .args(&arguments[1..])
+            .current_dir(&set)
+            // The agent is the one pod the studio talks to: its stdin is
+            // the protocol, not a closed door.
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn();
+        match spawn {
+            Ok(mut child) => {
+                let stdin = child.stdin.take();
+                let (sender, feed) = std::sync::mpsc::sync_channel(READ_QUEUE);
+                if let Some(stdout) = child.stdout.take() {
+                    let sender = sender.clone();
+                    std::thread::spawn(move || {
+                        forward_tagged_stream(
+                            std::io::BufReader::new(stdout),
+                            sender,
+                            AgentFeed::Record,
+                        )
+                    });
+                }
+                if let Some(stderr) = child.stderr.take() {
+                    std::thread::spawn(move || {
+                        forward_tagged_stream(
+                            std::io::BufReader::new(stderr),
+                            sender,
+                            AgentFeed::Diagnostics,
+                        )
+                    });
+                }
+                self.log.push(
+                    LogLevel::Info,
+                    "pod",
+                    format!("started {program} as the agent"),
+                );
+                self.pod_agent = Some(AgentPod {
+                    program,
+                    stdin,
+                    feed,
+                    child,
+                    next_id: 1,
+                });
+                Ok(())
+            }
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
     /// Take what the running pod has said since the last turn into the
     /// log, and finish a pod whose work is done: a command once its
     /// process has exited and its readers have read the last of it, so
     /// no line is dropped on the way out, an llm rewrite once its thread
-    /// has answered.
+    /// has answered, an agent prompt once the agent has settled - while
+    /// the agent itself stays alive for the next prompt.
     pub(super) fn pump_pod(&mut self) {
-        let Some(run) = self.pod_run.take() else {
+        let run = self.pod_run.take();
+        // A living agent gets its turn whatever else is running: its feed
+        // must keep moving - a full queue blocks the readers, and through
+        // them the agent itself - and a dead one is said in the log, so
+        // the next submit spawns fresh. An agent prompt's own pump reads
+        // the same feed, so the duty is its alone.
+        if !run
+            .as_ref()
+            .is_some_and(|run| matches!(run.body, PodBody::Agent { .. }))
+        {
+            self.pump_agent();
+        }
+        let Some(run) = run else {
             return;
         };
         let PodRun {
@@ -991,7 +1295,195 @@ impl App {
                     self.dirty_frame = true;
                 }
             },
+            PodBody::Agent { id, pending } => {
+                self.pump_agent_prompt(program, id, pending, capture);
+            }
         }
+    }
+
+    /// One turn of an agent prompt in flight: the agent's records are
+    /// parsed out of its feed, its text deltas and tool narration
+    /// stream into the capture, and the prompt ends when the agent
+    /// settles - while the process stays alive for the next prompt.
+    /// See [`agent_record`] for what each record is worth saying.
+    fn pump_agent_prompt(
+        &mut self,
+        program: String,
+        id: String,
+        mut pending: String,
+        mut capture: Capture,
+    ) {
+        let (items, gone) = self.take_agent_feed();
+        let mut settled = None;
+        let mut refused = None;
+        let mut handled = false;
+        for item in items {
+            let say = match item {
+                // The agent's own diagnostics, kept off its stdout by the
+                // protocol: the log takes them the way it takes a command
+                // pod's stderr.
+                AgentFeed::Diagnostics(line) => AgentSay::raw(line),
+                AgentFeed::Record(line) => {
+                    match serde_json::from_str::<serde_json::Value>(&line) {
+                        Ok(record) => agent_record(&line, &record, &id, &mut pending),
+                        // Not the protocol: the agent's own words, like any
+                        // pod's output.
+                        Err(_) => AgentSay::raw(line),
+                    }
+                }
+            };
+            for said in say.lines {
+                capture.push(said.clone());
+                self.log.push(LogLevel::Info, "pod", said);
+                self.dirty_frame = true;
+            }
+            settled = settled.or(say.settled);
+            refused = refused.or(say.refused);
+            handled |= say.handled;
+        }
+        // The prompt is over when the agent settles, refuses it, handles
+        // it with no run, or is gone; the tail of the answer, which no
+        // newline of its own ended, goes out before the completion line.
+        if (settled.is_some() || refused.is_some() || handled || gone) && !pending.is_empty() {
+            capture.push(pending.clone());
+            let tail = std::mem::take(&mut pending);
+            self.log.push(LogLevel::Info, "pod", tail);
+            self.dirty_frame = true;
+        }
+        let note = capture.truncation_note();
+        if gone {
+            let how = self.agent_gone();
+            self.log.push(
+                LogLevel::Warn,
+                "pod",
+                format!("{program} failed \u{b7} the agent {how}{note}"),
+            );
+            self.status = format!("pod failed \u{b7} the agent {how}");
+            self.dirty_frame = true;
+            return;
+        }
+        if let Some(message) = refused {
+            self.log.push(
+                LogLevel::Warn,
+                "pod",
+                format!("{program} refused the prompt \u{b7} {message}{note}"),
+            );
+            self.status = format!("pod failed \u{b7} {message}");
+            self.dirty_frame = true;
+            return;
+        }
+        if handled {
+            // An extension command took the prompt with no run of its
+            // own: no agent_settled follows, so the prompt ends here.
+            self.log.push(
+                LogLevel::Info,
+                "pod",
+                format!("{program} handled the prompt without a run{note}"),
+            );
+            self.status = "pod finished".into();
+            self.dirty_frame = true;
+            return;
+        }
+        if let Some(aborted) = settled {
+            if aborted {
+                self.log.push(
+                    LogLevel::Warn,
+                    "pod",
+                    format!("{program} gave up \u{b7} the run was aborted{note}"),
+                );
+                self.status = "pod failed \u{b7} the agent gave up".into();
+            } else {
+                self.log
+                    .push(LogLevel::Info, "pod", format!("{program} answered{note}"));
+                self.status = "pod finished \u{b7} the agent answered".into();
+            }
+            self.dirty_frame = true;
+            return;
+        }
+        // Still working: the prompt waits for another turn.
+        self.pod_run = Some(PodRun {
+            program,
+            body: PodBody::Agent { id, pending },
+            capture,
+        });
+    }
+
+    /// The agent process's own turn, whenever no agent prompt is reading
+    /// its feed - between prompts, or while another kind of pod runs.
+    /// Its diagnostics still land in the log; protocol records pass by
+    /// unmentioned, because between prompts they say nothing the player
+    /// asked for; and a dead one is taken away and said, so the next
+    /// submit spawns a fresh one.
+    fn pump_agent(&mut self) {
+        if self.pod_agent.is_none() {
+            return;
+        }
+        let (items, gone) = self.take_agent_feed();
+        for item in items {
+            let line = match item {
+                AgentFeed::Diagnostics(line) => line,
+                AgentFeed::Record(line) => {
+                    match serde_json::from_str::<serde_json::Value>(&line) {
+                        // The protocol talking to itself: not the
+                        // player's business between prompts.
+                        Ok(record) if record.get("type").is_some() => continue,
+                        // Anything else is the agent's own words.
+                        _ => line,
+                    }
+                }
+            };
+            self.log.push(LogLevel::Info, "pod", line);
+            self.dirty_frame = true;
+        }
+        if gone {
+            let how = self.agent_gone();
+            self.status = format!("the agent {how}");
+            self.dirty_frame = true;
+        }
+    }
+
+    /// Up to one turn's worth of the agent's feed, and whether both of
+    /// its readers have finished: their end is the protocol's own way of
+    /// saying the process is gone.
+    fn take_agent_feed(&mut self) -> (Vec<AgentFeed>, bool) {
+        let mut items = Vec::new();
+        let Some(agent) = self.pod_agent.as_mut() else {
+            // No process under a prompt still waiting on one: the prompt
+            // ends rather than hangs on a feed nobody fills.
+            return (items, true);
+        };
+        for _ in 0..LINES_PER_TURN {
+            match agent.feed.try_recv() {
+                Ok(item) => items.push(item),
+                Err(TryRecvError::Empty) => return (items, false),
+                Err(TryRecvError::Disconnected) => return (items, true),
+            }
+        }
+        (items, false)
+    }
+
+    /// Take the agent away - its feed's end means the process is gone,
+    /// or will not be spoken to again - and say it in the log, so the
+    /// next submit spawns a fresh one. Returns the short form for the
+    /// footer.
+    fn agent_gone(&mut self) -> String {
+        let Some(mut agent) = self.pod_agent.take() else {
+            return "is gone".into();
+        };
+        let how = match agent.how_it_ended() {
+            Some(status) => format!("exited: {status}"),
+            None => "closed its output".into(),
+        };
+        self.log.push(
+            LogLevel::Warn,
+            "pod",
+            format!(
+                "the agent {} {how} \u{b7} the next prompt starts a fresh one",
+                agent.program
+            ),
+        );
+        self.dirty_frame = true;
+        how
     }
 
     /// The rewrite came back: the returned score goes into the tab the
@@ -1047,6 +1539,129 @@ impl App {
         // external-changes row.
         self.apply_external_change();
     }
+}
+
+/// What one record from the agent said, as [`agent_record`] reads it.
+#[derive(Default)]
+struct AgentSay {
+    /// Lines for the capture and the log, in the order they were said.
+    lines: Vec<String>,
+    /// The agent settled: `Some(true)` with the run aborted, `Some(false)`
+    /// with the answer given. `None`: the run is still on.
+    settled: Option<bool>,
+    /// The response record refused the prompt outright; the message is
+    /// why.
+    refused: Option<String>,
+    /// The response record handled the prompt with no run of its own,
+    /// so no `agent_settled` will follow.
+    handled: bool,
+}
+
+impl AgentSay {
+    /// A line that is not the protocol at all: the agent's own words.
+    fn raw(line: String) -> Self {
+        Self {
+            lines: vec![line],
+            ..Self::default()
+        }
+    }
+}
+
+/// What one protocol record from the agent says: the lines worth
+/// putting in the capture, what the answer added to `pending`, and how
+/// the prompt fared. The records the studio does not narrate - the
+/// turns starting and ending, the messages' bookkeeping - pass by
+/// unmentioned; the ones that say something to the player are the
+/// answer's text deltas, the tools running, and the run settling.
+fn agent_record(
+    line: &str,
+    record: &serde_json::Value,
+    prompt_id: &str,
+    pending: &mut String,
+) -> AgentSay {
+    let mut say = AgentSay::default();
+    match record.get("type").and_then(|kind| kind.as_str()) {
+        // The prompt's own receipt. Only the response under this
+        // prompt's id counts; anything else is not ours, and is said as
+        // it came the way a wrong answer would be.
+        Some("response") => {
+            if record.get("id").and_then(|id| id.as_str()) != Some(prompt_id) {
+                say.lines.push(line.to_owned());
+                return say;
+            }
+            if !record
+                .get("success")
+                .and_then(|success| success.as_bool())
+                .unwrap_or(false)
+            {
+                say.refused = Some(
+                    record
+                        .get("error")
+                        .and_then(|error| error.as_str())
+                        .unwrap_or("without a reason")
+                        .to_owned(),
+                );
+                return say;
+            }
+            // A prompt an extension handled with no run: no
+            // agent_settled follows, so the prompt ends here.
+            // `started` and `queued` leave it waiting for one.
+            if record
+                .pointer("/data/disposition")
+                .and_then(|how| how.as_str())
+                == Some("handled")
+            {
+                say.handled = true;
+            }
+        }
+        // The answer, streaming: each delta adds to the pending line,
+        // and every newline in it ends one.
+        Some("message_update") => {
+            let event = &record["assistantMessageEvent"];
+            if event.get("type").and_then(|kind| kind.as_str()) == Some("text_delta")
+                && let Some(delta) = event.get("delta").and_then(|delta| delta.as_str())
+            {
+                pending.push_str(delta);
+                while let Some(at) = pending.find('\n') {
+                    let complete: String = pending.drain(..=at).collect();
+                    say.lines
+                        .push(complete.trim_end_matches(['\n', '\r']).to_owned());
+                }
+            }
+        }
+        // The tools, narrated: what ran, and how it went.
+        Some("tool_execution_start") => {
+            if let Some(name) = record.get("toolName").and_then(|name| name.as_str()) {
+                say.lines.push(format!("tool {name}"));
+            }
+        }
+        Some("tool_execution_end") => {
+            if let Some(name) = record.get("toolName").and_then(|name| name.as_str()) {
+                let failed = record
+                    .get("isError")
+                    .and_then(|bad| bad.as_bool())
+                    .unwrap_or(false);
+                let milliseconds = record.get("durationMs").and_then(|ms| ms.as_u64());
+                say.lines.push(match (failed, milliseconds) {
+                    (true, _) => format!("tool {name} failed"),
+                    (false, Some(ms)) => format!("tool {name} done in {ms} ms"),
+                    (false, None) => format!("tool {name} done"),
+                });
+            }
+        }
+        // The run is over: `aborted` says whether the answer was given
+        // or the agent was stopped partway.
+        Some("agent_settled") => {
+            say.settled = Some(
+                record
+                    .get("aborted")
+                    .and_then(|aborted| aborted.as_bool())
+                    .unwrap_or(false),
+            );
+        }
+        _ => {}
+    }
+    say
 }
 
 #[cfg(test)]
@@ -1708,17 +2323,20 @@ mod tests {
                 app.status
             );
 
-            // The agent rung is selectable but nothing answers for it yet,
-            // and there is no row to point at either.
+            // The agent kind has a command of its own, with a default:
+            // cleared, the refusal names the row; kept, the prompt opens
+            // ready to ask the default's first word.
             press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
             app.ui_settings.pod_kind = PodKind::Agent;
+            app.ui_settings.agent_command.clear();
             app.open_pod_prompt(PodPromptKind::Request);
             assert!(app.pod_prompt.is_none());
-            assert!(
-                app.status.contains("agent pods are not built yet"),
-                "{}",
-                app.status
-            );
+            assert!(app.status.contains("no agent command"), "{}", app.status);
+            app.ui_settings.agent_command = crate::settings::AGENT_COMMAND_DEFAULT.into();
+            app.open_pod_prompt(PodPromptKind::Request);
+            let prompt = app.pod_prompt.as_ref().expect("the default configures it");
+            assert_eq!(prompt.kind, PodPromptKind::Request);
+            assert!(app.status.contains("Enter asks pi"), "{}", app.status);
         }
 
         /// The kind row routes the prompt: `llm` asks the endpoint and
@@ -2044,6 +2662,442 @@ mod tests {
             // An unreadable spelling reads as the default, not as an
             // error: the preferences file is hand-editable.
             assert_eq!(PodKind::parse("nonsense"), PodKind::Command);
+        }
+    }
+
+    mod agent {
+        //! Tests for the agent pod: the RPC loop against a fake agent -
+        //! a tiny script standing in for the real `pi` - proving the
+        //! spawn, the prompt command under its own id, the streamed
+        //! events parsed into the capture, the process outliving its
+        //! prompts, and the shutdown that ends it.
+
+        use super::super::*;
+        use super::pod::{has, pod_lines};
+        use crate::app::tests::support::*;
+
+        #[cfg(unix)]
+        /// The fake agent script: one JSONL command per line on stdin,
+        /// answered with a response record under the same id, two text
+        /// deltas, and an agent_settled event - the shape a real agent's
+        /// run takes. `$1` takes every line it reads, `$2` its process
+        /// id, and `$3` picks a behaviour: `die` exits with status 3 as
+        /// soon as the prompt lands (a crashed agent), `slow` waits ten
+        /// seconds before answering (a prompt in flight), `linger`
+        /// becomes a sleep that outlives its input (only the studio's
+        /// shutdown can end it), and anything else answers and exits
+        /// when stdin closes.
+        fn fake_agent() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+            let home = tempfile::tempdir().expect("temp dir");
+            let script = home.path().join("fake-agent");
+            std::fs::write(
+                &script,
+                r##"#!/bin/sh
+received=$1
+pidfile=$2
+echo $$ > "$pidfile"
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$received"
+  if [ "$3" = die ]; then exit 3; fi
+  if [ "$3" = slow ]; then sleep 10; fi
+  id=${line#*\"id\":\"}
+  id=${id%%\"*}
+  printf '{"id":"%s","type":"response","command":"prompt","success":true,"data":{"disposition":"started"}}\n' "$id"
+  printf '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"the agent says "}}\n'
+  printf '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"hello"}}\n'
+  printf '{"type":"agent_settled","aborted":false}\n'
+done
+printf 'eof\n' >> "$received"
+if [ "$3" = linger ]; then exec sleep 300; fi
+"##,
+            )
+            .expect("write the fake agent");
+            make_executable(&script);
+            let received = home.path().join("received");
+            let pidfile = home.path().join("pid");
+            (home, received, pidfile)
+        }
+
+        /// Make the script a program the studio can run, the way a real
+        /// agent's launcher is. A prerequisite the caller checks at
+        /// runtime, like every process test's binaries.
+        #[cfg(unix)]
+        fn make_executable(script: &std::path::Path) {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(script)
+                .expect("the script exists")
+                .permissions();
+            std::fs::set_permissions(script, std::fs::Permissions::from_mode(mode.mode() | 0o755))
+                .expect("make the script runnable");
+        }
+
+        /// Whether the process `pid` is still running, straight from the
+        /// kernel: the tests have no other handle on a process the studio
+        /// took away.
+        #[cfg(unix)]
+        fn process_alive(pid: u32) -> bool {
+            std::path::Path::new(&format!("/proc/{pid}")).exists()
+        }
+
+        /// Point the app's agent command at the fake agent and its files.
+        #[cfg(unix)]
+        fn agent_configured(
+            app: &mut App,
+            script: &std::path::Path,
+            received: &std::path::Path,
+            pidfile: &std::path::Path,
+            mode: &str,
+        ) {
+            app.ui_settings.pod_kind = PodKind::Agent;
+            app.ui_settings.agent_command = format!(
+                "{} {} {} {mode}",
+                script.display(),
+                received.display(),
+                pidfile.display()
+            );
+        }
+
+        /// Submit `prompt` through the pod prompt.
+        #[cfg(unix)]
+        fn submit(app: &mut App, prompt: &str) {
+            app.open_pod_prompt(PodPromptKind::Request);
+            type_text(app, prompt);
+            press(app, KeyCode::Enter, KeyModifiers::NONE);
+        }
+
+        /// Pump until the prompt in flight is done.
+        #[cfg(unix)]
+        fn finish(app: &mut App) {
+            for _ in 0..600 {
+                app.pump_pod();
+                if app.pod_run.is_none() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            panic!("the agent never settled");
+        }
+
+        /// The command lines the fake agent read, parsed as JSON in the
+        /// order the studio sent them.
+        #[cfg(unix)]
+        fn sent_commands(received: &std::path::Path) -> Vec<serde_json::Value> {
+            std::fs::read_to_string(received)
+                .expect("the fake agent's file")
+                .lines()
+                .filter(|line| !line.trim().is_empty() && *line != "eof")
+                .map(|line| serde_json::from_str(line).expect("a JSONL command line"))
+                .collect()
+        }
+
+        /// The process id the fake agent wrote down when it started.
+        #[cfg(unix)]
+        fn pid_from(pidfile: &std::path::Path) -> u32 {
+            std::fs::read_to_string(pidfile)
+                .expect("the fake agent's pid")
+                .trim()
+                .parse()
+                .expect("a process id")
+        }
+
+        /// The process tests' prerequisites: a shell to run the fake
+        /// agent, and a /proc to ask whether a process is alive - checked
+        /// at runtime, the way the suite checks the binaries its other
+        /// process tests need.
+        #[cfg(unix)]
+        fn process_tests_possible() -> bool {
+            has("/bin/sh") && process_alive(std::process::id())
+        }
+
+        /// The whole Mode B loop, without the real pi: the studio spawns
+        /// the configured agent with a parseable command line, the prompt
+        /// goes out as one RPC command under an id, the streamed events
+        /// land in the capture as lines, the response under the same id
+        /// is correlated rather than dumped in the log, and the process
+        /// stays alive to take a second prompt - the accumulated context
+        /// the kind exists for.
+        #[cfg(unix)]
+        #[test]
+        fn the_agent_answers_under_its_prompt_ids_and_stays_alive() {
+            if !process_tests_possible() {
+                return;
+            }
+            let (home, received, pidfile) = fake_agent();
+            let (mut app, _) = plain_app(home.path(), "$: s(\"bd\")\\n");
+            agent_configured(
+                &mut app,
+                &home.path().join("fake-agent"),
+                &received,
+                &pidfile,
+                "answer",
+            );
+            // The command template names a command pod, which must stay
+            // home while the kind is agent.
+            app.ui_settings.pod_command = "/bin/echo hello {prompt}".into();
+
+            submit(&mut app, "make it funky");
+            assert!(app.pod_run.is_some(), "the prompt is in flight");
+            finish(&mut app);
+            assert!(app.pod_agent.is_some(), "the process outlives the prompt");
+
+            let lines = pod_lines(&app);
+            assert!(
+                lines.iter().any(|line| line.contains("as the agent")),
+                "the log says the agent started: {lines:?}"
+            );
+            assert!(
+                lines.contains(&"the agent says hello"),
+                "the two deltas became one line in the capture: {lines:?}"
+            );
+            assert!(
+                lines.iter().any(|line| line.contains("answered")),
+                "settling finished the prompt: {lines:?}"
+            );
+            assert!(
+                !lines
+                    .iter()
+                    .any(|line| line.contains("\"type\":\"response\"")),
+                "the receipt was correlated under its id, not dumped raw: {lines:?}"
+            );
+            assert!(
+                !lines
+                    .iter()
+                    .any(|line| line.contains("hello make it funky")),
+                "the command template stayed home: {lines:?}"
+            );
+
+            // The command line the agent read: a parseable prompt command
+            // with the text and the exact id its response answered.
+            let sent = sent_commands(&received);
+            assert_eq!(sent.len(), 1, "one prompt, one command line");
+            assert_eq!(sent[0]["type"], "prompt");
+            assert_eq!(sent[0]["message"], "make it funky");
+            assert_eq!(sent[0]["id"], "pod-1", "the first prompt's id");
+
+            // The second prompt goes to the same process, under the next
+            // id: the context accumulates because the process never went.
+            let pid = pid_from(&pidfile);
+            assert!(process_alive(pid), "the agent is still running");
+            submit(&mut app, "again");
+            finish(&mut app);
+            assert!(app.pod_agent.is_some(), "still the same agent");
+            assert_eq!(pid_from(&pidfile), pid, "no fresh process was spawned");
+            assert!(process_alive(pid), "the same process answered");
+            let sent = sent_commands(&received);
+            assert_eq!(sent.len(), 2, "the second prompt went out");
+            assert_eq!(sent[1]["message"], "again");
+            assert_eq!(sent[1]["id"], "pod-2", "the second prompt's own id");
+            assert_eq!(
+                pod_lines(&app)
+                    .iter()
+                    .filter(|line| line.contains("as the agent"))
+                    .count(),
+                1,
+                "the agent was spawned once for both prompts"
+            );
+        }
+
+        /// A crashed agent is said in the log, and the next submit spawns
+        /// a fresh one: the crash costs the context, not the feature.
+        #[cfg(unix)]
+        #[test]
+        fn a_dead_agent_is_said_and_the_next_prompt_starts_a_fresh_one() {
+            if !process_tests_possible() {
+                return;
+            }
+            let (home, received, pidfile) = fake_agent();
+            let (mut app, _) = plain_app(home.path(), "$: s(\"bd\")\\n");
+            agent_configured(
+                &mut app,
+                &home.path().join("fake-agent"),
+                &received,
+                &pidfile,
+                "die",
+            );
+
+            submit(&mut app, "make it funky");
+            finish(&mut app);
+            assert!(app.pod_agent.is_none(), "the dead agent was taken away");
+            let lines = pod_lines(&app);
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.contains("exited") && line.contains("status: 3")),
+                "the log says how the agent died: {lines:?}"
+            );
+            assert!(
+                app.status.contains("failed"),
+                "the footer says the prompt failed: {}",
+                app.status
+            );
+
+            // The next submit spawns a fresh one - which, in die mode,
+            // dies the same way: what is proved here is the fresh
+            // process taking the prompt, not its survival.
+            let first = pid_from(&pidfile);
+            submit(&mut app, "try again");
+            finish(&mut app);
+            let second = pid_from(&pidfile);
+            assert_ne!(first, second, "the fresh agent is a new process");
+            let lines = pod_lines(&app);
+            assert_eq!(
+                lines
+                    .iter()
+                    .filter(|line| line.contains("as the agent"))
+                    .count(),
+                2,
+                "a fresh agent was spawned for the second prompt: {lines:?}"
+            );
+            // A fresh process counts its own ids from one.
+            let sent = sent_commands(&received);
+            assert_eq!(sent.len(), 2, "the second prompt reached the fresh agent");
+            assert_eq!(sent[1]["message"], "try again");
+            assert_eq!(sent[1]["id"], "pod-1", "a fresh process counts its own ids");
+        }
+
+        /// The agent dies with the studio: the shutdown closes the
+        /// agent's stdin first - the protocol's own way down, which the
+        /// lingering fake ignores - and what is still up after a moment
+        /// is killed. Only the studio's shutdown can end that process.
+        #[cfg(unix)]
+        #[test]
+        fn the_agent_dies_with_the_studio() {
+            if !process_tests_possible() {
+                return;
+            }
+            let (home, received, pidfile) = fake_agent();
+            let (mut app, _) = plain_app(home.path(), "$: s(\"bd\")\\n");
+            agent_configured(
+                &mut app,
+                &home.path().join("fake-agent"),
+                &received,
+                &pidfile,
+                "linger",
+            );
+            submit(&mut app, "make it funky");
+            finish(&mut app);
+            let pid = pid_from(&pidfile);
+            assert!(process_alive(pid), "the agent is up before the shutdown");
+
+            // The studio goes out of scope: its Drop is the shutdown path.
+            drop(app);
+            let deadline = std::time::Instant::now() + Duration::from_secs(6);
+            while process_alive(pid) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the studio's shutdown never ended the lingering agent"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            // The stdin close reached it on the way down - the orderly
+            // half of the shutdown - and the kill ended it.
+            assert!(
+                std::fs::read_to_string(&received)
+                    .expect("the fake agent's file")
+                    .contains("eof"),
+                "the shutdown closed the agent's stdin before killing it"
+            );
+        }
+
+        /// A prompt while an agent is working is refused, the way every
+        /// kind refuses a second pod: no queueing, no steering.
+        #[cfg(unix)]
+        #[test]
+        fn a_running_agent_prompt_refuses_a_second_one() {
+            if !process_tests_possible() {
+                return;
+            }
+            let (home, received, pidfile) = fake_agent();
+            let (mut app, _) = plain_app(home.path(), "$: s(\"bd\")\\n");
+            agent_configured(
+                &mut app,
+                &home.path().join("fake-agent"),
+                &received,
+                &pidfile,
+                "slow",
+            );
+            submit(&mut app, "make it funky");
+            assert!(app.pod_run.is_some(), "the agent is working on it");
+
+            app.open_pod_prompt(PodPromptKind::Request);
+            assert!(app.pod_prompt.is_none(), "a second agent prompt is refused");
+            assert!(app.status.contains("already running"), "{}", app.status);
+            app.ui_settings.pod_kind = PodKind::Command;
+            app.ui_settings.pod_command = "/bin/echo {prompt}".into();
+            app.open_pod_prompt(PodPromptKind::Request);
+            assert!(
+                app.pod_prompt.is_none(),
+                "a command prompt is refused while the agent works"
+            );
+            assert!(app.pod_run.is_some(), "the working agent was left alone");
+        }
+
+        /// An agent command that cannot run is a failure said in the log,
+        /// not a crash: the next submit with a working command tries
+        /// again.
+        #[cfg(unix)]
+        #[test]
+        fn an_agent_that_cannot_start_is_said_in_the_log() {
+            if !has("/bin/sh") {
+                return;
+            }
+            let home = tempfile::tempdir().expect("temp dir");
+            let (mut app, _) = plain_app(home.path(), "$: s(\"bd\")\\n");
+            app.ui_settings.pod_kind = PodKind::Agent;
+            app.ui_settings.agent_command = "/no/such/agent --mode rpc".into();
+            app.open_pod_prompt(PodPromptKind::Request);
+            type_text(&mut app, "go");
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(app.pod_run.is_none(), "nothing is running");
+            assert!(app.pod_agent.is_none());
+            assert!(
+                app.status.contains("could not start the agent"),
+                "{}",
+                app.status
+            );
+            assert!(
+                pod_lines(&app)
+                    .iter()
+                    .any(|line| line.contains("could not start /no/such/agent")),
+                "the log names the program that would not run"
+            );
+        }
+
+        /// The agent command row keeps its template the way the command
+        /// row does: the default is the shipped `pi` line, Enter edits
+        /// it over the sheet, and a cleared row refuses agent pods.
+        #[test]
+        fn the_agent_command_row_edits_and_keeps_its_template() {
+            let home = tempfile::tempdir().expect("temp dir");
+            let (mut app, _) = plain_app(home.path(), "$: s(\"bd\")\\n");
+            assert_eq!(
+                app.ui_settings.agent_command,
+                crate::settings::AGENT_COMMAND_DEFAULT,
+                "the row ships with the pi command line"
+            );
+            app.toggle_settings_sheet();
+            let sheet = app.settings_sheet.as_mut().expect("the sheet");
+            sheet.selected = crate::settings::agent_command_row();
+            app.handle_settings_key(KeyCode::Enter, false, false);
+            let prompt = app.pod_prompt.as_ref().expect("the agent command prompt");
+            assert_eq!(prompt.kind, PodPromptKind::AgentCommand);
+            assert!(app.settings_sheet.is_some(), "the sheet stays open");
+            type_text(&mut app, "my-agent --mode rpc");
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert_eq!(app.ui_settings.agent_command, "my-agent --mode rpc");
+            assert_eq!(
+                app.prefs.agent_command.as_deref(),
+                Some("my-agent --mode rpc"),
+                "the template reaches the preferences"
+            );
+
+            // A cleared row is the agent pod turned off, and a request
+            // says so.
+            app.ui_settings.pod_kind = PodKind::Agent;
+            app.ui_settings.agent_command.clear();
+            app.open_pod_prompt(PodPromptKind::Request);
+            assert!(app.pod_prompt.is_none());
+            assert!(app.status.contains("no agent command"), "{}", app.status);
         }
     }
 }

@@ -101,6 +101,11 @@ pub struct StudioPrefs {
     /// wins over it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub llm_api_key: Option<String>,
+    /// The command line the agent pod spawns. Absent is the default
+    /// (`pi --mode rpc --no-session`); an empty string is the agent pod
+    /// turned off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_command: Option<String>,
     /// Whether an update renames the score's file to its `@title` field.
     /// Absent is off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -852,6 +857,10 @@ impl StudioPrefs {
             llm_endpoint: self.llm_endpoint.clone().unwrap_or_default(),
             llm_model: self.llm_model.clone().unwrap_or_default(),
             llm_api_key: self.llm_api_key.clone().unwrap_or_default(),
+            agent_command: self
+                .agent_command
+                .clone()
+                .unwrap_or_else(|| super::settings::AGENT_COMMAND_DEFAULT.to_owned()),
             sync_name_from_title: self
                 .sync_name_from_title
                 .unwrap_or(defaults.sync_name_from_title),
@@ -1063,6 +1072,7 @@ impl StudioPrefs {
         self.llm_endpoint = Some(settings.llm_endpoint.clone());
         self.llm_model = Some(settings.llm_model.clone());
         self.llm_api_key = Some(settings.llm_api_key.clone());
+        self.agent_command = Some(settings.agent_command.clone());
         self.sync_name_from_title = Some(settings.sync_name_from_title);
         self.load_mode = Some(settings.load_mode.key().to_owned());
         self.animation = Some(settings.animation);

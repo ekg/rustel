@@ -1511,6 +1511,11 @@ struct App {
     /// A pod running in the background: the external agent the player
     /// configured, rewriting score files for the watch to follow.
     pod_run: Option<pod::PodRun>,
+    /// The agent pod's process, kept alive across prompts so its context
+    /// accumulates. The prompt in flight is `pod_run` like any pod's; this
+    /// is the process underneath, which outlives it - and dies with the
+    /// studio. See `pod.rs`.
+    pod_agent: Option<pod::AgentPod>,
     replay_edit: Option<replay_edit::ReplayEdit>,
     /// How loud a sample preview plays, 1.0 being unity. It goes past unity
     /// on purpose: a browser next to a playing set needs headroom to be
@@ -1980,6 +1985,7 @@ impl App {
             smart_action: None,
             pod_prompt: None,
             pod_run: None,
+            pod_agent: None,
             replay_edit: None,
             preview_gain: 1.0,
             mixer_fader: 0,

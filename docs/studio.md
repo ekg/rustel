@@ -421,9 +421,10 @@ Settings ▸ Live coding:
 | --- | --- |
 | `command` | the command template below - an external program, run with no shell |
 | `llm` | one chat call to an OpenAI-compatible endpoint, which answers with the rewritten score |
-| `agent` | a built-in agent pod - not built yet; the prompt refuses while this kind is chosen |
+| `agent` | a persistent agent process, kept alive across prompts - it rewrites the score files itself |
 
-All the rows start empty, so until one is filled in the prompt answers with
+All the rows start empty except the agent command, which ships with the
+`pi` command line below - until one is filled in, the prompt answers with
 where to go.
 
 #### The command pod
@@ -488,6 +489,53 @@ was not the chat JSON it promised), and the editor is untouched. A reply that
 is not a valid score is refused the way an update refuses one: the last good
 score keeps playing and the log says why.
 
+#### The agent pod
+
+The agent pod is a persistent agent process: the **agent command** row names
+its command line, which Studio runs in the background with the set folder as
+its working directory - and then keeps alive. One process answers every
+prompt, which is the whole point: each prompt lands in the same conversation,
+so the agent remembers the score, the changes it already made, and what it
+said about them. (The llm pod starts from nothing each time; the command pod
+is a fresh process per prompt; only the agent accumulates a context.)
+
+The command line must select an agent that speaks the RPC protocol: JSON
+records, one per line, commands on its stdin, responses and events on its
+stdout. The default is:
+
+```text
+pi --mode rpc --no-session
+```
+
+`pi` runs with its own file tools, so it rewrites the score files itself:
+name the file in the prompt (`make first.strudel funkier`), and what the
+agent saves, the [external changes](#external-changes) watch follows -
+`sync` takes the saved text into the editor, and `sync & eval` opens the
+score's tab and plays it - or apply it yourself with the update key. That
+watch is off by default; until it is on, the agent's writes land in the files
+and Studio does not follow them.
+
+While a prompt runs, the agent's answer streams into the Log under `pod` -
+its text as it is written, one line per line of answer, and a line per tool
+as it runs and finishes - kept to the bounded tail like any pod's output. The
+prompt is done when the agent settles. The agent's own diagnostics (its
+stderr) land in the log too.
+
+The default's `--no-session` gives the agent an in-memory session that lasts
+exactly as long as the studio does. Session persistence is a flag away, per
+`pi --help`: drop `--no-session` and the session file is written, `--session-dir
+<dir>` says where, `--continue` resumes the most recent session for the
+folder, and `--name <name>` names it. Pass any of them by editing the agent
+command row - the row is the whole command line, split on whitespace with no
+shell, and the prompt travels in the protocol rather than in the arguments.
+Any other program that speaks the same JSONL protocol stands in for `pi`.
+
+One agent process exists at a time, and it dies with the studio: closing
+its stdin is the protocol's own way down, and what is still up a moment
+later is killed. An agent that dies or crashes is said in the Log, and the
+next prompt starts a fresh one - with a fresh context to build, which is the
+cost of the crash.
+
 #### All kinds
 
 A running pod is a row in the jobs sheet and the header's chip; the footer
@@ -496,7 +544,9 @@ the kind - a prompt submitted while one runs is refused, because two of them
 writing one file is a race nobody asked for. There is no cancellation for
 the same reason: killing a pod mid-write leaves a half-written score. The
 command pod runs unattended, with its input closed, so configure it for
-non-interactive use. A terminal that cannot tell ^⇧J from ^J, or keeps ^⇧J for
+non-interactive use; the agent pod is the exception - its stdin is the
+protocol it is spoken to, and the studio is the one closing it on the way
+out. A terminal that cannot tell ^⇧J from ^J, or keeps ^⇧J for
 itself, leaves the pod prompt without a chord; learn one on
 Settings ▸ Keybinds, the way the knobs column's chord is learnt there.
 

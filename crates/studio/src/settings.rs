@@ -624,8 +624,7 @@ impl ExternalChanges {
 
 /// Which pod the pod prompt hands the score to. The rows below the kind
 /// configure the kind it names: the command template for `command`, the
-/// endpoint, model and key for `llm`. `agent` is selectable but nothing
-/// answers for it yet.
+/// endpoint, model and key for `llm`, the command line for `agent`.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum PodKind {
     /// The command template: an external program, run with no shell.
@@ -634,8 +633,10 @@ pub enum PodKind {
     /// One chat call to an OpenAI-compatible endpoint, which answers
     /// with the rewritten score.
     Llm,
-    /// A built-in agent pod. Not built yet: submitting a prompt while
-    /// this rung is chosen is refused.
+    /// A persistent agent process speaking the RPC protocol on its stdin
+    /// and stdout: one process kept alive across prompts, so its context
+    /// accumulates; it rewrites the score files itself with its own file
+    /// tools. See `app/pod.rs`.
     Agent,
 }
 
@@ -682,6 +683,16 @@ impl PodKind {
 /// already holds never has to be typed into the preferences file, which
 /// keeps it as plain text.
 pub const LLM_KEY_ENV: &str = "RUSTEL_LLM_KEY";
+
+/// The agent command template's default: `pi`, the coding agent whose
+/// RPC mode this pod speaks, with no session file, so a fresh agent's
+/// context lasts exactly as long as the studio does. The row is
+/// player-overridable - any program that speaks the same JSONL protocol
+/// on stdin and stdout stands in - and session persistence is a flag
+/// away: `pi --mode rpc` without `--no-session` writes a session file,
+/// and `--session-dir <dir>` says where, so an agent that should
+/// remember earlier nights can be configured to.
+pub const AGENT_COMMAND_DEFAULT: &str = "pi --mode rpc --no-session";
 
 /// The llm key row's value: never the whole key, because a settings
 /// sheet is read over shoulders. `environment` when [`LLM_KEY_ENV`]
@@ -1868,6 +1879,12 @@ pub struct UiSettings {
     /// plain text; [`LLM_KEY_ENV`] in the environment wins over it, for
     /// players who would rather not store the key at all.
     pub llm_api_key: String,
+    /// The command line the agent pod spawns when the pod kind is
+    /// `agent`: a program speaking the RPC protocol (JSONL commands on
+    /// stdin, responses and events on stdout), kept alive across
+    /// prompts. The default is [`AGENT_COMMAND_DEFAULT`]; empty leaves
+    /// agent pods refused. See `app/pod.rs`.
+    pub agent_command: String,
     /// Whether an update renames the score's file to its `@title` field.
     /// Off by default: a file's name is the player's own arrangement, and
     /// files that moved on their own would be a surprise the first time.
@@ -2061,6 +2078,7 @@ impl Default for UiSettings {
             llm_endpoint: String::new(),
             llm_model: String::new(),
             llm_api_key: String::new(),
+            agent_command: AGENT_COMMAND_DEFAULT.to_owned(),
             sync_name_from_title: true,
             load_mode: LoadMode::Wait,
             clock_out: None,
@@ -2195,7 +2213,8 @@ enum Row {
     /// What happens when another program saves the open score's file.
     ExternalChanges,
     /// Which pod the pod prompt hands the score to: the command template
-    /// below, an llm rewrite, or the agent pod that is not built yet.
+    /// below, an llm rewrite, or the agent pod the `agent command` row
+    /// names.
     PodKind,
     /// The command the pod prompt hands the score to when the kind is
     /// `command`. Empty hides the feature; Enter edits the template. See
@@ -2207,6 +2226,9 @@ enum Row {
     LlmModel,
     /// The API key the llm pod sends; Enter edits it.
     LlmApiKey,
+    /// The command line the agent pod spawns when the kind is `agent`;
+    /// Enter edits it. See `app/pod.rs`.
+    AgentCommand,
     /// Whether an update renames the score's file to its `@title` field.
     SyncNameFromTitle,
     /// How a start or an edit meets sounds still loading.
@@ -2434,6 +2456,7 @@ const ROWS: &[Row] = &[
     Row::LlmEndpoint,
     Row::LlmModel,
     Row::LlmApiKey,
+    Row::AgentCommand,
     Row::SyntaxCheck,
     Row::SetsFolder,
     Row::RecordingsFolder,
@@ -2588,6 +2611,14 @@ pub fn llm_endpoint_row() -> usize {
         .expect("the llm endpoint row is on the first page")
 }
 
+/// The agent command row's place on the General page, for the tests that
+/// walk the sheet to it.
+pub fn agent_command_row() -> usize {
+    ROWS.iter()
+        .position(|row| matches!(row, Row::AgentCommand))
+        .expect("the agent command row is on the first page")
+}
+
 pub(super) fn keybind_action_at(row: usize) -> Option<BindAction> {
     row.checked_sub(KEYBIND_ACTION_START)
         .and_then(|index| BindAction::ALL.get(index).copied())
@@ -2685,7 +2716,8 @@ impl Row {
             | Self::PodCommand
             | Self::LlmEndpoint
             | Self::LlmModel
-            | Self::LlmApiKey => "Live coding",
+            | Self::LlmApiKey
+            | Self::AgentCommand => "Live coding",
 
             // The one latency knob: what the OUTPUT costs is a
             // machine-level choice, set once like a DAW's buffer size.
@@ -2758,6 +2790,7 @@ impl Row {
             Self::LlmEndpoint => "llm endpoint",
             Self::LlmModel => "llm model",
             Self::LlmApiKey => "llm key",
+            Self::AgentCommand => "agent command",
             Self::LoadMode => "load mode",
             Self::Animation => "visualizers",
             Self::Highlights => "highlights",
@@ -2845,7 +2878,7 @@ impl Row {
             Self::ExternalChanges => {
                 "sync: the editor takes another program's save \u{b7} sync & eval: and plays it"
             }
-            Self::PodKind => "which pod the prompt runs \u{b7} agent is not built yet",
+            Self::PodKind => "which pod the prompt runs",
             Self::PodCommand => {
                 "the agent the pod prompt runs \u{b7} {prompt} {set} {file} \u{b7} Enter edits it"
             }
@@ -2853,6 +2886,9 @@ impl Row {
             Self::LlmModel => "the model the rewrite request names \u{b7} Enter edits it",
             Self::LlmApiKey => {
                 "stored as plain text in the preferences \u{b7} RUSTEL_LLM_KEY in the environment wins over it"
+            }
+            Self::AgentCommand => {
+                "the RPC agent the prompt talks to \u{b7} one process, alive across prompts \u{b7} Enter edits it"
             }
             Self::LoadMode => "wait: plays once its sounds load · async: skips late notes",
             Self::Animation => "pianoroll, scope and friends draw",
@@ -3201,6 +3237,8 @@ pub enum SettingsAction {
     EditLlmModel,
     /// Enter on the llm key row: the sheet hands over to a prompt.
     EditLlmApiKey,
+    /// Enter on the agent command row: the sheet hands over to a prompt.
+    EditAgentCommand,
     EditVimMappingsPath,
     ResetVimMappingsPath,
     /// Enter on the sample cache row: empty it. Armed by a first Enter;
@@ -4054,6 +4092,7 @@ impl SettingsSheet {
                 | Row::LlmEndpoint
                 | Row::LlmModel
                 | Row::LlmApiKey
+                | Row::AgentCommand
                 | Row::CacheDefaults
                 | Row::RefreshSources
                 | Row::SampleCache => {}
@@ -4138,6 +4177,7 @@ impl SettingsSheet {
                     None if row == Some(&Row::LlmEndpoint) => SettingsAction::EditLlmEndpoint,
                     None if row == Some(&Row::LlmModel) => SettingsAction::EditLlmModel,
                     None if row == Some(&Row::LlmApiKey) => SettingsAction::EditLlmApiKey,
+                    None if row == Some(&Row::AgentCommand) => SettingsAction::EditAgentCommand,
                     None if row == Some(&Row::RecordingsFolder) => {
                         SettingsAction::ChooseRecordingsFolder
                     }

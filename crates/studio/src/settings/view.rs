@@ -137,6 +137,15 @@ impl Widget for SettingsSheetView<'_> {
                 }
                 // Never the whole key: the sheet is read over shoulders.
                 Row::LlmApiKey => llm_key_readout(&self.settings.llm_api_key),
+                // A template row again: the default is the shipped `pi`
+                // command line, and `not set` is the agent pod refused.
+                Row::AgentCommand => {
+                    if self.settings.agent_command.trim().is_empty() {
+                        "not set".to_owned()
+                    } else {
+                        self.settings.agent_command.trim().to_owned()
+                    }
+                }
                 Row::LoadMode => self.settings.load_mode.label().to_owned(),
                 Row::Animation => on_off(self.settings.animation),
                 Row::Highlights => on_off(self.settings.highlights),
