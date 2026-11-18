@@ -1351,17 +1351,13 @@ impl App {
             self.dirty_frame = true;
         }
         let note = capture.truncation_note();
-        if gone {
-            let how = self.agent_gone();
-            self.log.push(
-                LogLevel::Warn,
-                "pod",
-                format!("{program} failed \u{b7} the agent {how}{note}"),
-            );
-            self.status = format!("pod failed \u{b7} the agent {how}");
-            self.dirty_frame = true;
-            return;
-        }
+        // A prompt that ends on the agent's answer, refusal or handled
+        // receipt is reported as such even when the agent exits on the
+        // heels of it - any JSONL-RPC program may exit after completing
+        // a run, and only a bare exit falls back to the gone report. In
+        // every ended case a dead agent is taken away first, so the next
+        // submit spawns a fresh one and the log says how it exited.
+        let exited = if gone { Some(self.agent_gone()) } else { None };
         if let Some(message) = refused {
             self.log.push(
                 LogLevel::Warn,
@@ -1397,6 +1393,16 @@ impl App {
                     .push(LogLevel::Info, "pod", format!("{program} answered{note}"));
                 self.status = "pod finished \u{b7} the agent answered".into();
             }
+            self.dirty_frame = true;
+            return;
+        }
+        if let Some(how) = exited {
+            self.log.push(
+                LogLevel::Warn,
+                "pod",
+                format!("{program} failed \u{b7} the agent {how}{note}"),
+            );
+            self.status = format!("pod failed \u{b7} the agent {how}");
             self.dirty_frame = true;
             return;
         }
@@ -2685,8 +2691,10 @@ mod tests {
         /// soon as the prompt lands (a crashed agent), `slow` waits ten
         /// seconds before answering (a prompt in flight), `linger`
         /// becomes a sleep that outlives its input (only the studio's
-        /// shutdown can end it), and anything else answers and exits
-        /// when stdin closes.
+        /// shutdown can end it), `bye` answers and then exits 0 (an
+        /// agent that completes its run and leaves, as any JSONL-RPC
+        /// program may), and anything else answers and stays for the
+        /// next prompt.
         fn fake_agent() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
             let home = tempfile::tempdir().expect("temp dir");
             let script = home.path().join("fake-agent");
@@ -2706,6 +2714,7 @@ while IFS= read -r line; do
   printf '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"the agent says "}}\n'
   printf '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"hello"}}\n'
   printf '{"type":"agent_settled","aborted":false}\n'
+  if [ "$3" = bye ]; then exit 0; fi
 done
 printf 'eof\n' >> "$received"
 if [ "$3" = linger ]; then exec sleep 300; fi
@@ -2953,6 +2962,64 @@ if [ "$3" = linger ]; then exec sleep 300; fi
             assert_eq!(sent.len(), 2, "the second prompt reached the fresh agent");
             assert_eq!(sent[1]["message"], "try again");
             assert_eq!(sent[1]["id"], "pod-1", "a fresh process counts its own ids");
+        }
+
+        /// An agent that answers and then exits - `bye`, the way any
+        /// JSONL-RPC program may leave after completing a run - finishes
+        /// its prompt as answered, not failed: the exit is still said in
+        /// the log and the dead process still taken away, but the answer
+        /// is what the footer reports.
+        #[cfg(unix)]
+        #[test]
+        fn an_agent_that_answers_and_exits_finishes_the_prompt_as_answered() {
+            if !process_tests_possible() {
+                return;
+            }
+            let (home, received, pidfile) = fake_agent();
+            let (mut app, _) = plain_app(home.path(), "$: s(\"bd\")\\n");
+            agent_configured(
+                &mut app,
+                &home.path().join("fake-agent"),
+                &received,
+                &pidfile,
+                "bye",
+            );
+
+            submit(&mut app, "make it funky");
+            finish(&mut app);
+            assert!(app.pod_agent.is_none(), "the exited agent was taken away");
+            assert!(
+                app.status.contains("answered"),
+                "the footer reports the answer, not the exit: {}",
+                app.status
+            );
+            assert!(
+                !app.status.contains("failed"),
+                "the exit did not fail it: {}",
+                app.status
+            );
+            let lines = pod_lines(&app);
+            assert!(
+                lines.contains(&"the agent says hello"),
+                "the answer was logged: {lines:?}"
+            );
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.contains("exited") && line.contains("fresh one")),
+                "the exit is still said in the log: {lines:?}"
+            );
+
+            // The next submit spawns a fresh one, exactly as after a
+            // crash: what the exit costs is the context, not the feature.
+            let first = pid_from(&pidfile);
+            submit(&mut app, "try again");
+            finish(&mut app);
+            let second = pid_from(&pidfile);
+            assert_ne!(first, second, "a fresh agent took the second prompt");
+            let sent = sent_commands(&received);
+            assert_eq!(sent.len(), 2, "the second prompt reached the fresh agent");
+            assert_eq!(sent[1]["message"], "try again");
         }
 
         /// The agent dies with the studio: the shutdown closes the

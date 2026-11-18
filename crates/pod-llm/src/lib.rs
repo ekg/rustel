@@ -201,11 +201,16 @@ struct ChatMessage {
 fn ureq_error(error: ureq::Error) -> PodLlmError {
     match error {
         ureq::Error::Status(status, response) => {
-            let mut body = String::new();
+            // Bytes, then lossy text: the head can cut a multi-byte
+            // character in the middle, and an error body owes the caller
+            // diagnostics no encoding contract at all. Either way the
+            // head is kept, as the `Http` variant's doc promises.
+            let mut head = Vec::new();
             let _ = response
                 .into_reader()
                 .take(MAX_ERROR_BODY_BYTES)
-                .read_to_string(&mut body);
+                .read_to_end(&mut head);
+            let body = String::from_utf8_lossy(&head).into_owned();
             PodLlmError::Http { status, body }
         }
         ureq::Error::Transport(transport) => PodLlmError::Transport(transport.to_string()),
@@ -246,10 +251,14 @@ mod tests {
     use std::thread::JoinHandle;
 
     /// Serves one HTTP request on a background thread and answers it with
-    /// `response`, a complete HTTP/1.1 reply. Returns the base URL to call
-    /// and a handle that joins to the request the client sent, head and
-    /// body, for header and body assertions.
-    fn serve_once(response: String) -> (String, JoinHandle<String>) {
+    /// `response`, a complete HTTP/1.1 reply as raw bytes, so a test can
+    /// also serve an error body that is not UTF-8. Returns the base URL
+    /// to call and a handle that joins to the request the client sent,
+    /// head and body, for header and body assertions.
+    fn serve_once(response: impl Into<Vec<u8>>) -> (String, JoinHandle<String>) {
+        // Bytes, so a test can also serve an error body that is not
+        // UTF-8; the closure takes the reply already converted.
+        let response = response.into();
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind a loopback listener");
         let address = listener.local_addr().expect("read the listener's address");
         let server = std::thread::Builder::new()
@@ -257,9 +266,7 @@ mod tests {
             .spawn(move || {
                 let (mut stream, _) = listener.accept().expect("the client connects");
                 let request = read_request(&mut stream);
-                stream
-                    .write_all(response.as_bytes())
-                    .expect("write the canned reply");
+                stream.write_all(&response).expect("write the canned reply");
                 request
             })
             .expect("spawn the mock server thread");
@@ -399,6 +406,34 @@ mod tests {
         assert!(
             matches!(error, PodLlmError::Http { status: 500, ref body } if body == "boom"),
             "the error names the status: {error:?}"
+        );
+    }
+
+    #[test]
+    fn an_error_body_that_is_not_utf8_still_keeps_its_head() {
+        // An error body owes the caller no encoding, and the 512-byte
+        // head can cut a multi-byte character in half: a Latin-1 byte
+        // and a truncated four-byte sequence must both survive as
+        // lossy text, not be dropped whole by a failed UTF-8 read.
+        let error_body: &[u8] = b"caf\xe9 \xf0\x9f";
+        let mut reply = format!(
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            error_body.len()
+        )
+        .into_bytes();
+        reply.extend_from_slice(error_body);
+        let (base, server) = serve_once(reply);
+        let error = Endpoint::new(base, "test-model", "test-key")
+            .rewrite("system text", "user text")
+            .expect_err("a 500 fails the rewrite");
+        server.join().expect("the mock server thread ends");
+        assert!(
+            matches!(
+                error,
+                PodLlmError::Http { status: 500, ref body }
+                    if body == "caf\u{fffd} \u{fffd}"
+            ),
+            "the head is kept, lossily spelled: {error:?}"
         );
     }
 

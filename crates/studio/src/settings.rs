@@ -1866,7 +1866,7 @@ pub struct UiSettings {
     /// `app/pod.rs`.
     pub pod_command: String,
     /// Which pod the prompt runs: the command template, an llm rewrite,
-    /// or the agent pod that is not built yet.
+    /// or the agent pod the `agent command` row names.
     pub pod_kind: PodKind,
     /// The base URL the llm pod posts to: the part ahead of
     /// `/chat/completions`, for example `https://api.openai.com/v1`.
