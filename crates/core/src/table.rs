@@ -1322,9 +1322,88 @@ impl Ahead {
 #[derive(Debug)]
 pub(crate) struct Kept {
     haps: Box<[Hap]>,
+    /// The times of the haps on one grid, when one grid holds them.
+    ticks: Option<Ticks>,
     /// Whether the haps hold data only, as the walk said.
     data_only: bool,
     _charge: Charge,
+}
+
+/// The times of kept haps as whole ticks of one grid. A cut compares and
+/// orders ticks, with no arithmetic of fractions.
+#[derive(Debug)]
+struct Ticks {
+    /// Ticks in one cycle.
+    cycle: i64,
+    /// The part and then the whole of each hap, each from its begin to its
+    /// end.
+    haps: Box<[[i64; 4]]>,
+}
+
+impl Ticks {
+    /// The most ticks in a cycle. Finer times are compared as fractions.
+    const FINEST: i64 = 1 << 20;
+
+    /// `None` for haps that no grid holds: one with no whole, or times
+    /// finer than [`Self::FINEST`] or outside the range of a tick.
+    fn of(haps: &[Hap]) -> Option<Self> {
+        let times = |hap: &Hap| {
+            let whole = hap.whole?;
+            Some([hap.part.begin, hap.part.end, whole.begin, whole.end])
+        };
+        let mut cycle = 1;
+        for hap in haps {
+            for time in times(hap)? {
+                cycle = Self::holding(cycle, time)?;
+            }
+        }
+        // A cut may read the ticks on a grid up to the finest one.
+        let finest = Self::FINEST / cycle;
+        let tick = |time| Self::at(cycle, time).filter(|tick| tick.checked_mul(finest).is_some());
+        let haps = haps
+            .iter()
+            .map(|hap| {
+                let [begin, end, whole_begin, whole_end] = times(hap)?;
+                Some([
+                    tick(begin)?,
+                    tick(end)?,
+                    tick(whole_begin)?,
+                    tick(whole_end)?,
+                ])
+            })
+            .collect::<Option<_>>()?;
+        Some(Self { cycle, haps })
+    }
+
+    /// The ticks in a cycle of the coarsest grid that holds `time` and a
+    /// grid of `cycle` ticks. `None` past [`Self::FINEST`].
+    fn holding(cycle: i64, time: Fraction) -> Option<i64> {
+        let denom = i64::try_from(time.denom()).ok()?;
+        if cycle % denom == 0 {
+            return Some(cycle);
+        }
+        let finer = Fraction::int(cycle.into()).checked_lcm(Fraction::int(denom.into()))?;
+        i64::try_from(finer.numer())
+            .ok()
+            .filter(|&cycle| cycle <= Self::FINEST)
+    }
+
+    /// `time` in ticks of a grid of `cycle` ticks that holds it.
+    fn at(cycle: i64, time: Fraction) -> Option<i64> {
+        let denom = i64::try_from(time.denom()).ok()?;
+        i64::try_from(time.numer()).ok()?.checked_mul(cycle / denom)
+    }
+
+    /// A grid that holds the haps and `span`: how many of its ticks one
+    /// tick of the haps is, and the span on it.
+    fn with(&self, span: TimeSpan) -> Option<(i64, i64, i64)> {
+        let cycle = Self::holding(Self::holding(self.cycle, span.begin)?, span.end)?;
+        Some((
+            cycle / self.cycle,
+            Self::at(cycle, span.begin)?,
+            Self::at(cycle, span.end)?,
+        ))
+    }
 }
 
 /// What a [`Run`] is to a query at its root.
@@ -1470,6 +1549,7 @@ impl Kept {
         }
         let charge = Charge::take(haps.len() * std::mem::size_of::<Hap>())?;
         Some(Self {
+            ticks: Ticks::of(&haps),
             haps: haps.into_boxed_slice(),
             data_only,
             _charge: charge,
@@ -1480,9 +1560,49 @@ impl Kept {
         self.data_only
     }
 
-    /// The haps that sound in `span`, each cut to it, in the order of the
-    /// graph: what a walk of `span` answers.
-    pub(crate) fn cut(&self, span: TimeSpan) -> Vec<Hap> {
+    /// The haps that sound in `span`, each cut to it: what a walk of `span`
+    /// answers, in the order of the graph or sorted as a query sorts.
+    pub(crate) fn cut(&self, span: TimeSpan, order: Order) -> Vec<Hap> {
+        let on_grid = self
+            .ticks
+            .as_ref()
+            .and_then(|ticks| Some((ticks, ticks.with(span)?)));
+        let Some((ticks, (scale, begin, end))) = on_grid else {
+            let haps = self.cut_by_fractions(span);
+            return match order {
+                Order::Graph => haps,
+                Order::Sorted => crate::sort_haps_for_query(haps),
+            };
+        };
+        // Each hap that sounds, with its times after the cut: what a query
+        // sorts by. Equal times keep the order of the graph.
+        let mut found = Vec::with_capacity(crate::FEW_HAPS.min(self.haps.len()));
+        for (at, &[from, to, whole_begin, whole_end]) in ticks.haps.iter().enumerate() {
+            let (from, to) = (from * scale, to * scale);
+            if from < end && begin < to {
+                found.push(([from.max(begin), to.min(end), whole_begin, whole_end], at));
+            }
+        }
+        if order == Order::Sorted {
+            found.sort_by_key(|&(times, _)| times);
+        }
+        found
+            .into_iter()
+            .map(|([from, to, ..], at)| {
+                let mut hap = self.haps[at].clone();
+                if from == begin {
+                    hap.part.begin = span.begin;
+                }
+                if to == end {
+                    hap.part.end = span.end;
+                }
+                hap
+            })
+            .collect()
+    }
+
+    /// [`Self::cut`] in the order of the graph, for times on no grid.
+    fn cut_by_fractions(&self, span: TimeSpan) -> Vec<Hap> {
         let sounds = |hap: &&Hap| hap.part.begin < span.end && span.begin < hap.part.end;
         // Room for the haps of a short span, which most queries of a run
         // ask.
@@ -5393,6 +5513,72 @@ mod tests {
             let tick = TimeSpan::new(frac(begin, 20), frac(end, 20));
             let near = entries.near(tick, 0).expect("the entries near");
             assert!((1..=14).contains(&near.each().count()), "{tick:?}");
+        }
+    }
+
+    /// A cut of a kept answer is the haps that sound in the span, each
+    /// cut to it, in the order kept or as a query sorts them: for haps
+    /// whose order changes with the cut, for a span on no grid of theirs,
+    /// and for haps too fine for a grid.
+    #[test]
+    fn a_cut_of_a_kept_answer_is_its_haps_cut_and_sorted() {
+        let hap = |whole: (Fraction, Fraction), part: (Fraction, Fraction), value: f64| {
+            Hap::new(
+                Some(TimeSpan::new(whole.0, whole.1)),
+                TimeSpan::new(part.0, part.1),
+                Value::F64(value),
+            )
+        };
+        let long = (frac(0, 1), frac(4, 1));
+        let coarse = vec![
+            // Two parts of one whole, the longer one first.
+            hap(long, (frac(1, 2), frac(2, 1)), 0.0),
+            hap(long, (frac(1, 2), frac(1, 1)), 1.0),
+            hap((frac(1, 2), frac(1, 1)), (frac(1, 2), frac(1, 1)), 2.0),
+            // A chord: equal times keep their order.
+            hap((frac(3, 8), frac(5, 8)), (frac(3, 8), frac(5, 8)), 4.0),
+            hap((frac(3, 8), frac(5, 8)), (frac(3, 8), frac(5, 8)), 3.0),
+            hap((frac(1, 3), frac(2, 3)), (frac(1, 3), frac(2, 3)), 5.0),
+            hap((frac(-1, 4), frac(3, 4)), (frac(0, 1), frac(3, 4)), 6.0),
+            hap((frac(1, 8), frac(1, 4)), (frac(1, 8), frac(1, 4)), 7.0),
+        ];
+        let mut fine = coarse.clone();
+        fine.push(hap(
+            (frac(1, 1_048_583), frac(1, 2)),
+            (frac(1, 1_048_583), frac(1, 2)),
+            8.0,
+        ));
+        for (name, haps, gridded) in [("coarse", coarse, true), ("fine", fine, false)] {
+            let kept = Kept::of(haps.clone(), true).expect("haps to keep");
+            assert_eq!(kept.ticks.is_some(), gridded, "{name}");
+            // The last spans are too fine for a grid.
+            for denom in [8, 24, 7, 1_048_583] {
+                for begin in (0..2 * denom).step_by(1 + denom as usize / 40) {
+                    for width in [1, 3, denom] {
+                        let span = TimeSpan::new(frac(begin, denom), frac(begin + width, denom));
+                        let cut: Vec<Hap> = haps
+                            .iter()
+                            .filter_map(|hap| {
+                                let part = hap.part.intersection(&span)?;
+                                (part.begin < part.end).then(|| Hap {
+                                    part,
+                                    ..hap.clone()
+                                })
+                            })
+                            .collect();
+                        assert_eq!(
+                            describe_all(&kept.cut(span, Order::Graph)),
+                            describe_all(&cut),
+                            "{name} over {span:?}"
+                        );
+                        assert_eq!(
+                            describe_all(&kept.cut(span, Order::Sorted)),
+                            describe_all(&crate::sort_haps_for_query(cut)),
+                            "{name} sorted over {span:?}"
+                        );
+                    }
+                }
+            }
         }
     }
 

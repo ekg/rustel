@@ -6909,10 +6909,7 @@ impl Pattern {
         if query_stop_requested() {
             return Some((Vec::new(), true));
         }
-        let haps = match order {
-            table::Order::Graph => kept.cut(span),
-            table::Order::Sorted => sort_haps_for_query(kept.cut(span)),
-        };
+        let haps = kept.cut(span, order);
         // The last query that the answer holds. No query of the run reads
         // the answer again, so the root keeps the span and frees the haps.
         if span.end == run.span().end {
