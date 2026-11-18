@@ -23,6 +23,7 @@ members = [
     "crates/csound",
     "crates/vst3-fixture",
     "crates/kabel",
+    "crates/pod-llm",
     "crates/studio-e2e",
     "xtask",
 ]
