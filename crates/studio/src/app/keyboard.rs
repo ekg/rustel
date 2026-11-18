@@ -647,6 +647,12 @@ impl App {
         if self.quit_key(&terminal_event) {
             return Ok(());
         }
+        // The pod prompt owns the keys next, ahead of the panels: it can
+        // open over the settings sheet, and a prompt opened from the
+        // sheet is the exception to the sheet holding the keyboard.
+        if self.pod_prompt_event(&terminal_event) {
+            return Ok(());
+        }
         #[cfg(feature = "remote-control")]
         if self.remote_panel_event(&terminal_event) {
             return Ok(());
@@ -1203,6 +1209,13 @@ impl App {
         }
         if primary && shift && letter == Some('x') && !self.key_is_a_learnt_chord(key) {
             self.toggle_export_sheet();
+            return true;
+        }
+        // The pod prompt: J beside ^J's quick action, where the terminal
+        // tells ^⇧J from ^J. Opening it replaces whatever dialog is up,
+        // the way the export sheet does.
+        if primary && shift && letter == Some('j') && !self.key_is_a_learnt_chord(key) {
+            self.open_pod_prompt(super::pod::PodPromptKind::Request);
             return true;
         }
         if primary && shift && letter == Some('o') && !self.key_is_a_learnt_chord(key) {

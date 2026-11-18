@@ -1763,6 +1763,10 @@ pub struct UiSettings {
     /// What the studio does when another program saves the open score's
     /// file. Off by default: reading the file again is opted into.
     pub external_changes: ExternalChanges,
+    /// The command template the pod prompt runs, with `{prompt}`, `{set}`
+    /// and `{file}` placeholders. Empty by default: the pod is opted
+    /// into by configuring one. See `app/pod.rs`.
+    pub pod_command: String,
     /// Whether an update renames the score's file to its `@title` field.
     /// Off by default: a file's name is the player's own arrangement, and
     /// files that moved on their own would be a surprise the first time.
@@ -1951,6 +1955,7 @@ impl Default for UiSettings {
             auto_evaluate: false,
             typing_pause: TypingPause::Medium,
             external_changes: ExternalChanges::Off,
+            pod_command: String::new(),
             sync_name_from_title: true,
             load_mode: LoadMode::Wait,
             clock_out: None,
@@ -2073,6 +2078,9 @@ enum Row {
     TypingPause,
     /// What happens when another program saves the open score's file.
     ExternalChanges,
+    /// The command the pod prompt hands the score to. Empty hides the
+    /// feature; Enter edits the template. See `app/pod.rs`.
+    PodCommand,
     /// Whether an update renames the score's file to its `@title` field.
     SyncNameFromTitle,
     /// How a start or an edit meets sounds still loading.
@@ -2295,6 +2303,7 @@ const ROWS: &[Row] = &[
     Row::AutoEvaluate,
     Row::TypingPause,
     Row::ExternalChanges,
+    Row::PodCommand,
     Row::SyntaxCheck,
     Row::SetsFolder,
     Row::RecordingsFolder,
@@ -2425,6 +2434,14 @@ pub(super) fn keybind_count(settings: &UiSettings) -> usize {
     RESET_KEYBINDS_ROW + 1 + 2 * usize::from(settings.editor_keybindings == EditorKeybindings::Vim)
 }
 
+/// The pod command row's place on the General page, for the tests that
+/// walk the sheet to it.
+pub fn pod_command_row() -> usize {
+    ROWS.iter()
+        .position(|row| matches!(row, Row::PodCommand))
+        .expect("the pod command row is on the first page")
+}
+
 pub(super) fn keybind_action_at(row: usize) -> Option<BindAction> {
     row.checked_sub(KEYBIND_ACTION_START)
         .and_then(|index| BindAction::ALL.get(index).copied())
@@ -2515,7 +2532,9 @@ impl Row {
     fn group(self) -> &'static str {
         match self {
             Self::Quantise | Self::MasterLimiter | Self::LoadMode => "Playback",
-            Self::AutoEvaluate | Self::TypingPause | Self::ExternalChanges => "Live coding",
+            Self::AutoEvaluate | Self::TypingPause | Self::ExternalChanges | Self::PodCommand => {
+                "Live coding"
+            }
 
             // The one latency knob: what the OUTPUT costs is a
             // machine-level choice, set once like a DAW's buffer size.
@@ -2583,6 +2602,7 @@ impl Row {
             Self::AutoEvaluate => "auto evaluate",
             Self::TypingPause => "typing pause",
             Self::ExternalChanges => "watch external changes",
+            Self::PodCommand => "pod command",
             Self::LoadMode => "load mode",
             Self::Animation => "visualizers",
             Self::Highlights => "highlights",
@@ -2669,6 +2689,9 @@ impl Row {
             Self::TypingPause => "how long typing rests before the edit applies",
             Self::ExternalChanges => {
                 "sync: the editor takes another program's save \u{b7} sync & eval: and plays it"
+            }
+            Self::PodCommand => {
+                "the agent the pod prompt runs \u{b7} {prompt} {set} {file} \u{b7} Enter edits it"
             }
             Self::LoadMode => "wait: plays once its sounds load · async: skips late notes",
             Self::Animation => "pianoroll, scope and friends draw",
@@ -3009,6 +3032,8 @@ pub enum SettingsAction {
     ChooseSetsFolder,
     /// Enter on the recordings folder row: the sheet hands over to a picker.
     ChooseRecordingsFolder,
+    /// Enter on the pod command row: the sheet hands over to a prompt.
+    EditPodCommand,
     EditVimMappingsPath,
     ResetVimMappingsPath,
     /// Enter on the sample cache row: empty it. Armed by a first Enter;
@@ -3857,6 +3882,7 @@ impl SettingsSheet {
                 | Row::LocalPrebake
                 | Row::SetsFolder
                 | Row::RecordingsFolder
+                | Row::PodCommand
                 | Row::CacheDefaults
                 | Row::RefreshSources
                 | Row::SampleCache => {}
@@ -3937,6 +3963,7 @@ impl SettingsSheet {
                 match row.and_then(|row| row.opens_prebake()) {
                     Some(scope) => SettingsAction::OpenPrebake(scope),
                     None if row == Some(&Row::SetsFolder) => SettingsAction::ChooseSetsFolder,
+                    None if row == Some(&Row::PodCommand) => SettingsAction::EditPodCommand,
                     None if row == Some(&Row::RecordingsFolder) => {
                         SettingsAction::ChooseRecordingsFolder
                     }

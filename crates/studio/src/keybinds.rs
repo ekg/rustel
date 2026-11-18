@@ -102,6 +102,8 @@ pub enum BindAction {
     ToggleComment,
     /// Find text in the focused score.
     Find,
+    /// Open the pod prompt: hand a prompt to the configured pod command.
+    PodPrompt,
     FirstError,
     // Scenes
     NewScene,
@@ -137,7 +139,7 @@ pub enum BindAction {
 
 impl BindAction {
     /// Every action, in the order the Keybinds page lists them.
-    pub const ALL: [BindAction; 59] = [
+    pub const ALL: [BindAction; 60] = [
         // Transport
         Self::Evaluate,
         Self::Stop,
@@ -177,6 +179,7 @@ impl BindAction {
         Self::SelectAll,
         Self::ToggleComment,
         Self::Find,
+        Self::PodPrompt,
         Self::FirstError,
         // Scenes
         Self::NewScene,
@@ -245,6 +248,7 @@ impl BindAction {
             Self::SelectAll => "select-all",
             Self::ToggleComment => "comment",
             Self::Find => "find",
+            Self::PodPrompt => "pod-prompt",
             Self::FirstError => "first-error",
             Self::NewScene => "new-scene",
             Self::DuplicateScene => "duplicate-scene",
@@ -317,6 +321,7 @@ impl BindAction {
             Self::SelectAll => "select all",
             Self::ToggleComment => "comment or uncomment",
             Self::Find => "find text",
+            Self::PodPrompt => "pod prompt",
             Self::FirstError => "first error / locate cursor",
             Self::NewScene => "new scene",
             Self::DuplicateScene => "duplicate scene",
@@ -418,6 +423,12 @@ impl BindAction {
             // Ctrl+Shift+F is the familiar find chord, but nearly every
             // terminal keeps it. Y is free on all shipped profiles but Hyper.
             Self::Find => ctrl_shift(Char('y')),
+            // The pod prompt sits beside ^J's quick action on J, the next
+            // letter no shipped default holds after Y. Four profiles keep
+            // ^⇧J for themselves (kitty, GNOME and VTE, and Ghostty), and a
+            // legacy terminal cannot tell it from ^J; there it has no
+            // chord until one is learnt, like the knobs column.
+            Self::PodPrompt => ctrl_shift(Char('j')),
             Self::FirstError => shift(F(3)),
             Self::NewScene => ctrl(Char('n')),
             Self::DuplicateScene => plain(F(3)),
@@ -1161,8 +1172,11 @@ pub enum KeybindCapture {
 /// The actions that keep their default where the terminal can send it, and
 /// take no spare key where it cannot. The knobs column opens from View ▸
 /// Knobs too, so a legacy terminal's few spare keys stay with the actions
-/// that have no other door.
-pub const NO_SPARE_KEY: &[BindAction] = &[BindAction::Knobs];
+/// that have no other door. The pod prompt is on the same terms: its row on
+/// the Keybinds page is where a chord for it is learnt, and a terminal that
+/// cannot tell ^⇧J from ^J keeps its spare keys for actions with no page of
+/// their own.
+pub const NO_SPARE_KEY: &[BindAction] = &[BindAction::Knobs, BindAction::PodPrompt];
 
 /// The actions the studio ships with no chord, on purpose. Background jobs
 /// and Memory open from their View menu rows, and the memory breakdown from
@@ -2287,6 +2301,7 @@ mod tests {
                 ("forget-pad", "learn-pad"),
                 ("knobs", "zen-mode"),
                 ("open-set", "settings"),
+                ("pod-prompt", "smart-action"),
                 ("record-take", "rename-scene"),
                 ("redo", "undo"),
                 ("rewind-update", "update"),
@@ -2342,6 +2357,8 @@ mod tests {
                     ("knobs", String::new()),
                     ("next-scene", "F7".to_owned()),
                     ("open-set", "\u{21e7}F6".to_owned()),
+                    // Its Keybinds row stays its door: no spare key.
+                    ("pod-prompt", String::new()),
                     ("previous-scene", "F6".to_owned()),
                     ("record-take", "\u{21e7}F11".to_owned()),
                     ("redo", "^Y".to_owned()),

@@ -116,6 +116,14 @@ impl App {
                 percent: None,
             });
         }
+        // A pod runs until its process exits; its words go to the log
+        // while the row keeps it visible after Settings is closed.
+        if let Some(run) = self.pod_run.as_ref() {
+            jobs.push(BackgroundJob {
+                name: format!("pod {}", run.program),
+                percent: None,
+            });
+        }
         if let Some(job) = self.export_job.as_ref() {
             let glance = job.glance();
             let (name, percent) = if glance.preparing {

@@ -36,6 +36,7 @@
 //! | files dropped on the studio, bank rename | `sample_import.rs` |
 //! | the prebake tabs: global and per-set setup | `prebakes.rs` |
 //! | ^J, the quick action at the caret | `smart_action.rs` |
+//! | the pod prompt, and the pod command it runs | `pod.rs` |
 //! | the computer piano | `piano_mode.rs` |
 //! | jumping to the first error | `error_navigation.rs` |
 //! | pasting into prompts | `prompt_paste.rs` |
@@ -185,6 +186,7 @@ mod panes;
 mod permissions;
 mod persistence;
 mod piano_mode;
+mod pod;
 mod pointer_shape;
 mod power_advisory;
 mod prebakes;
@@ -1504,6 +1506,11 @@ struct App {
     slider_precision: Option<slider_precision::PrecisionSlider>,
     /// The quick action's menu, open at the caret.
     smart_action: Option<smart_action::SmartAction>,
+    /// The pod prompt, open over the studio. See `pod.rs`.
+    pod_prompt: Option<pod::PodPrompt>,
+    /// A pod running in the background: the external agent the player
+    /// configured, rewriting score files for the watch to follow.
+    pod_run: Option<pod::PodRun>,
     replay_edit: Option<replay_edit::ReplayEdit>,
     /// How loud a sample preview plays, 1.0 being unity. It goes past unity
     /// on purpose: a browser next to a playing set needs headroom to be
@@ -1971,6 +1978,8 @@ impl App {
             armed_slider: None,
             slider_precision: None,
             smart_action: None,
+            pod_prompt: None,
+            pod_run: None,
             replay_edit: None,
             preview_gain: 1.0,
             mixer_fader: 0,

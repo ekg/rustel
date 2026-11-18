@@ -72,6 +72,7 @@ type SmartPopup = ((u16, u16), Vec<String>, Option<(u16, u16)>);
 struct Overlays {
     precision: Option<slider_precision::PrecisionView>,
     smart: Option<SmartPopup>,
+    pod: Option<pod::PodPrompt>,
     replay_edit: Option<replay_edit::ReplayEdit>,
     help: Option<HelpState>,
     help_context: HelpContext,
@@ -848,6 +849,7 @@ impl App {
             (anchor, rows, state.form_caret(area))
         });
         let replay_edit = self.replay_edit.clone();
+        let pod = self.pod_prompt.clone();
         let help = self.help;
         let help_context = self.help_context();
         let theme_editor_visible = self.theme_editor_sheet_visible();
@@ -856,6 +858,7 @@ impl App {
         Overlays {
             precision,
             smart,
+            pod,
             replay_edit,
             help,
             help_context,
@@ -1753,6 +1756,9 @@ impl App {
         }
         if let Some((anchor, rows, caret)) = &overlays.smart {
             smart_action::render(frame, &self.theme, *anchor, rows, *caret);
+        }
+        if let Some(prompt) = &overlays.pod {
+            pod::render_prompt(frame, &self.theme, prompt);
         }
         // The knobs column's edit form draws its caret the way the quick
         // action's does: over the panel, in place of the score's caret,

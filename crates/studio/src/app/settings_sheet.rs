@@ -27,6 +27,7 @@ impl App {
     pub(super) fn settings_hold_the_keys(&self) -> bool {
         self.settings_sheet.is_some()
             && self.set_prompt.is_none()
+            && self.pod_prompt.is_none()
             && self.focus == Focus::Panel(PanelKind::Settings)
     }
 
@@ -887,6 +888,14 @@ impl App {
             SettingsAction::EditVimMappingsPath => {
                 self.settings_sheet = Some(sheet);
                 self.open_set_prompt(SetPrompt::VimMappingsPath);
+                #[cfg(feature = "hydra")]
+                self.sync_settings_webcam_preview();
+                return true;
+            }
+            // The sheet hands over to the pod command's own prompt.
+            SettingsAction::EditPodCommand => {
+                self.settings_sheet = Some(sheet);
+                self.open_pod_prompt(super::pod::PodPromptKind::Command);
                 #[cfg(feature = "hydra")]
                 self.sync_settings_webcam_preview();
                 return true;
@@ -2114,7 +2123,7 @@ mod tests {
             // Down to the machine rows at the page's end, onto max
             // polyphony: past the set rows, the load mode and the output
             // buffer.
-            for _ in 0..15 {
+            for _ in 0..16 {
                 press(&mut app, KeyCode::Down, KeyModifiers::NONE);
             }
             press(&mut app, KeyCode::Right, KeyModifiers::NONE);
@@ -2137,7 +2146,7 @@ mod tests {
             app.settings_sheet = Some(sheet);
             app.focus = Focus::Panel(PanelKind::Settings);
             // Down onto the load mode, past the set rows.
-            for _ in 0..13 {
+            for _ in 0..14 {
                 press(&mut app, KeyCode::Down, KeyModifiers::NONE);
             }
             press(&mut app, KeyCode::Right, KeyModifiers::NONE);

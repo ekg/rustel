@@ -385,6 +385,7 @@ impl App {
     pub(super) fn dismiss_dialogs_except(&mut self, keep: &[PanelKind]) {
         self.slider_precision = None;
         self.smart_action = None;
+        self.pod_prompt = None;
         self.replay_edit = None;
         self.editor_mut().find_cancel();
         if !keep.contains(&PanelKind::Set) && self.set_prompt.is_some() {

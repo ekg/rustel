@@ -110,6 +110,16 @@ impl Widget for SettingsSheetView<'_> {
                 Row::AutoEvaluate => on_off(self.settings.auto_evaluate),
                 Row::TypingPause => self.settings.typing_pause.label().to_owned(),
                 Row::ExternalChanges => self.settings.external_changes.label().to_owned(),
+                // The value column holds a template, not a switch: it
+                // says `not set` until the feature is configured, because
+                // an empty column there would read as a broken row.
+                Row::PodCommand => {
+                    if self.settings.pod_command.trim().is_empty() {
+                        "not set".to_owned()
+                    } else {
+                        self.settings.pod_command.trim().to_owned()
+                    }
+                }
                 Row::LoadMode => self.settings.load_mode.label().to_owned(),
                 Row::Animation => on_off(self.settings.animation),
                 Row::Highlights => on_off(self.settings.highlights),
