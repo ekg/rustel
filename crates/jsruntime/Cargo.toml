@@ -46,5 +46,17 @@ rquickjs = { version = "=0.14.0", git = "https://github.com/tzfm/rquickjs", rev 
     "loader",
 ] }
 
+# rquickjs-sys ships prebuilt bindings for its desktop targets only; it has
+# none for Android, where the build then fails on the missing
+# `bindings/<target>.rs` include. Feature unification with the declaration
+# above adds the `bindgen` feature for Android builds only, so the bindings
+# are generated from the QuickJS headers at build time instead. That path
+# needs libclang on the host; cargo-ndk points bindgen at the NDK sysroot
+# via `BINDGEN_EXTRA_CLANG_ARGS_<target>`.
+[target.'cfg(target_os = "android")'.dependencies]
+rquickjs = { git = "https://github.com/tzfm/rquickjs", rev = "ed2337c6f187996ef97f7e4e44458cfbc33266f4", features = [
+    "bindgen",
+] }
+
 [lints]
 workspace = true
