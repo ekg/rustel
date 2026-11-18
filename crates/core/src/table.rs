@@ -147,6 +147,8 @@ struct Layer {
     /// cycle of `[0, period)`: entry `cycle_starts[c]` is the first of cycle
     /// `c`, and the last item is the entry count. See [`Find::ByCycle`].
     cycle_starts: Option<Vec<u32>>,
+    /// For entries in any other order. See [`Find::Met`].
+    meetings: Option<Meetings>,
 }
 
 /// The entries a query answers from, and how it finds the ones of a period
@@ -165,8 +167,93 @@ enum Find<'a> {
     /// The entries come cycle by cycle, each part in one cycle. The span's
     /// cycles give the range. See [`Layer::cycle_starts`].
     ByCycle(&'a [u32]),
+    /// The entries come in any order, each part in `[0, period)`. A span
+    /// of one or two cycles looks at the entries that meet them.
+    Met(&'a Meetings),
     /// Every entry is looked at.
     Scan,
+}
+
+/// For each cycle of a period, the entries whose part meets it, in the
+/// order of the entries.
+#[derive(Clone, Debug)]
+struct Meetings {
+    /// Item `starts[c]` of `met` is the first of cycle `c`, and the last
+    /// item is the count.
+    starts: Vec<u32>,
+    met: Vec<u32>,
+}
+
+impl Meetings {
+    /// The most items for each entry: an entry of many cycles is in the
+    /// list of each.
+    const MOST: usize = 4;
+
+    /// `None` for a part outside `[0, period)`, and for lists that hold
+    /// more than [`Self::MOST`] items for each entry.
+    fn of(entries: &[Hap], period: i128) -> Option<Self> {
+        let cycles = usize::try_from(period).ok()?;
+        if cycles > MAX_ENTRIES {
+            return None;
+        }
+        let met_by = |entry: &Hap| {
+            let (first, last) = cycles_met(entry.part.begin, entry.part.end);
+            let (first, last) = (usize::try_from(first).ok()?, usize::try_from(last).ok()?);
+            (last < cycles).then_some(first..=last)
+        };
+        let mut starts = vec![0u32; cycles + 1];
+        let mut count = 0usize;
+        for entry in entries {
+            let cycles = met_by(entry)?;
+            count += cycles.clone().count();
+            if count > entries.len().saturating_mul(Self::MOST) {
+                return None;
+            }
+            for cycle in cycles {
+                starts[cycle + 1] += 1;
+            }
+        }
+        for cycle in 0..cycles {
+            starts[cycle + 1] += starts[cycle];
+        }
+        // Each list fills from its start, so it keeps the order.
+        let mut next = starts.clone();
+        let mut met = vec![0u32; count];
+        for (index, entry) in entries.iter().enumerate() {
+            let index = u32::try_from(index).ok()?;
+            for cycle in met_by(entry)? {
+                met[next[cycle] as usize] = index;
+                next[cycle] += 1;
+            }
+        }
+        Some(Self { starts, met })
+    }
+
+    /// The entries that may meet `begin..end`, a span of the period: the
+    /// lists of its one or two cycles. `None` for a span of more cycles.
+    fn near(&self, begin: Fraction, end: Fraction) -> Option<[&[u32]; 2]> {
+        let cycles = i128::try_from(self.starts.len() - 1).ok()?;
+        let (first, last) = cycles_met(begin, end);
+        let (first, last) = (first.max(0), last.min(cycles - 1));
+        let list = |cycle: i128| {
+            let cycle = usize::try_from(cycle).unwrap_or(0);
+            &self.met[self.starts[cycle] as usize..self.starts[cycle + 1] as usize]
+        };
+        match last - first {
+            0 => Some([list(first), &[]]),
+            1 => Some([list(first), list(last)]),
+            more if more > 1 => None,
+            // The span lies outside the period.
+            _ => Some([&[], &[]]),
+        }
+    }
+}
+
+/// The first and the last cycle that a span from `begin` to `end` meets. A
+/// span that ends at the start of a cycle does not meet that cycle.
+fn cycles_met(begin: Fraction, end: Fraction) -> (i128, i128) {
+    let first = begin.floor().numer();
+    (first, first.max(end.ceil().numer().saturating_sub(1)))
 }
 
 /// The entries of one period that may meet a span. The ones in `inside`
@@ -176,6 +263,82 @@ struct Near<'a> {
     /// Where `haps` begin among the entries.
     start: usize,
     inside: std::ops::Range<usize>,
+    /// Which of `haps` may meet the span, when a [`Meetings`] says so.
+    met: Option<[&'a [u32]; 2]>,
+}
+
+impl<'a> Near<'a> {
+    /// Each entry of a period that lies inside a span.
+    fn all(haps: &'a [Hap]) -> Self {
+        Self {
+            haps,
+            start: 0,
+            inside: 0..0,
+            met: None,
+        }
+    }
+
+    /// The entries in their order, each with its place among all entries.
+    fn each(&self) -> Each<'a> {
+        self.from(0)
+    }
+
+    /// [`Self::each`], for the entries after the ones `inside`.
+    fn after(&self) -> Each<'a> {
+        self.from(self.inside.end)
+    }
+
+    fn from(&self, at: usize) -> Each<'a> {
+        Each {
+            haps: self.haps,
+            start: self.start,
+            at,
+            met: self.met,
+        }
+    }
+
+    /// At most how many entries [`Self::each`] gives.
+    fn count(&self) -> usize {
+        match self.met {
+            Some([one, other]) => one.len() + other.len(),
+            None => self.haps.len(),
+        }
+    }
+}
+
+/// See [`Near::each`].
+struct Each<'a> {
+    haps: &'a [Hap],
+    start: usize,
+    at: usize,
+    met: Option<[&'a [u32]; 2]>,
+}
+
+impl<'a> Iterator for Each<'a> {
+    type Item = (usize, &'a Hap);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let Some([one, other]) = &mut self.met else {
+            let hap = self.haps.get(self.at)?;
+            self.at += 1;
+            return Some((self.start + self.at - 1, hap));
+        };
+        // An entry that meets both cycles is in both lists, and comes one
+        // time.
+        let index = match (one.first(), other.first()) {
+            (Some(&a), Some(&b)) => a.min(b),
+            (Some(&a), None) => a,
+            (None, Some(&b)) => b,
+            (None, None) => return None,
+        };
+        for list in [one, other] {
+            if list.first() == Some(&index) {
+                *list = &list[1..];
+            }
+        }
+        let index = index as usize;
+        Some((index, &self.haps[index]))
+    }
 }
 
 impl Answering<'_> {
@@ -186,6 +349,7 @@ impl Answering<'_> {
         let back = shift.checked_neg()?;
         let begin = span.begin.checked_add_int(back)?;
         let end = span.end.checked_add_int(back)?;
+        let mut met = None;
         let (haps, start, first, last) = match self.find {
             Find::Search => {
                 let from = self.haps.partition_point(|hap| hap.part.end <= begin);
@@ -215,20 +379,26 @@ impl Answering<'_> {
                     at(end.floor().numer()) - from,
                 )
             }
+            Find::Met(meetings) => {
+                met = meetings.near(begin, end);
+                (self.haps, 0, 0, 0)
+            }
             Find::Scan => (self.haps, 0, 0, 0),
         };
         Some(Near {
             haps,
             start,
             inside: first..last.max(first),
+            met,
         })
     }
 
     /// At most how many haps the period `shift` cycles on gives `span`.
     fn most(&self, span: TimeSpan, shift: i128) -> Option<usize> {
         let near = self.near(span, shift)?;
-        if !matches!(self.find, Find::Scan) {
-            return Some(near.haps.len());
+        let scans = matches!(self.find, Find::Scan | Find::Met(_)) && near.met.is_none();
+        if !scans {
+            return Some(near.count());
         }
         // A scan may look at many more entries than meet the span.
         let mut count = 0usize;
@@ -1793,6 +1963,10 @@ impl Layer {
         } else {
             cycle_starts(&entries, period)
         };
+        let meetings = match ordered || cycle_starts.is_some() {
+            true => None,
+            false => Meetings::of(&entries, period),
+        };
         Some(Self {
             period,
             entries,
@@ -1803,6 +1977,7 @@ impl Layer {
             sampled: None,
             whole_haps,
             cycle_starts,
+            meetings,
         })
     }
 
@@ -1889,10 +2064,11 @@ impl Layer {
             }),
             Order::Graph => Some(Answering {
                 haps: &self.entries,
-                find: self
-                    .cycle_starts
-                    .as_deref()
-                    .map_or(Find::Scan, Find::ByCycle),
+                find: match (&self.cycle_starts, &self.meetings) {
+                    (Some(starts), _) => Find::ByCycle(starts),
+                    (None, Some(meetings)) => Find::Met(meetings),
+                    (None, None) => Find::Scan,
+                },
             }),
             Order::Sorted => self.sorted.as_deref().map(|haps| Answering {
                 haps,
@@ -2038,13 +2214,11 @@ impl Layer {
         for k in periods.first..=periods.last {
             let shift = k.checked_mul(self.period)?;
             let from = out.haps.len();
-            let (near, first) = if periods.is_inside(k) {
-                (entries.haps, 0)
-            } else {
-                let near = entries.near(span, shift)?;
-                (near.haps, near.start)
+            let near = match periods.is_inside(k) {
+                true => Near::all(entries.haps),
+                false => entries.near(span, shift)?,
             };
-            for (index, entry) in (first..).zip(near) {
+            for (index, entry) in near.each() {
                 let Some(part) = shifted_span(entry.part, shift)?.intersection(&span) else {
                     continue;
                 };
@@ -2089,13 +2263,11 @@ impl Layer {
             let inside = periods.is_inside(k);
             let from = out.len();
             let mut met = 0;
-            let (near, first) = if inside {
-                (entries.haps, 0)
-            } else {
-                let near = entries.near(span, shift)?;
-                (near.haps, near.start)
+            let near = match inside {
+                true => Near::all(entries.haps),
+                false => entries.near(span, shift)?,
             };
-            for (index, entry) in (first..).zip(near) {
+            for (index, entry) in near.each() {
                 let shifted = shifted_span(entry.part, shift)?;
                 let part = if inside {
                     shifted
@@ -2185,7 +2357,7 @@ impl Layer {
                 clipped |= Self::push_clipped(entry, span, shift, out)?;
             }
             self.copy_shifted(&near.haps[near.inside.clone()], shift, out)?;
-            for entry in &near.haps[near.inside.end..] {
+            for (_, entry) in near.after() {
                 clipped |= Self::push_clipped(entry, span, shift, out)?;
             }
             if !stop.allows(from, out.len() - from) {
@@ -5167,6 +5339,63 @@ mod tests {
         );
     }
 
+    /// Sections of lanes, each restarted for a third of `cycles` cycles:
+    /// the entries of the period come lane by lane, in no time order. A
+    /// lane of steps in a cycle, one of steps across cycles, and one of
+    /// whole cycles.
+    fn sections_of_lanes(cycles: i128) -> Twin {
+        let section = |first: f64| {
+            map(
+                vec![
+                    seq(&[first, 1.0, 2.0, 3.0]),
+                    one(seq(&[5.0, 6.0, 7.0]), |p| p.slow(frac(9, 4))),
+                    alternation(3),
+                ],
+                stack,
+            )
+        };
+        picked_from(
+            one(seq(&[0.0, 1.0, 0.0]), |p| p.slow(Fraction::int(cycles))),
+            vec![section(0.0), section(4.0)],
+            PickIndexMode::Clamp,
+            JoinMode::Restart,
+        )
+    }
+
+    #[test]
+    fn narrow_queries_of_sections_of_lanes_match_the_graph() {
+        let mut spans = [ticks(12), straddles(12), spans()].concat();
+        for cycle in [-1, 0, 1, 4, 11, 12] {
+            let at = Fraction::int(cycle);
+            // A span that ends or begins at the cycle, one across it, and
+            // one of three cycles.
+            spans.extend([
+                (at - frac(1, 8), at),
+                (at, at + frac(1, 8)),
+                (at - frac(1, 8), at + frac(1, 8)),
+                (at - frac(5, 4), at + frac(5, 4)),
+            ]);
+        }
+        assert_twins_over("sections of lanes", &sections_of_lanes(12), &spans);
+    }
+
+    #[test]
+    fn a_narrow_query_of_lanes_looks_at_the_entries_of_its_cycles() {
+        let twin = sections_of_lanes(240);
+        let tables = twin.tabled.tables().expect("a table");
+        let [layer] = tables.layers.as_slice() else {
+            panic!("one layer");
+        };
+        let entries = layer.entries_in(Order::Graph).expect("graph order");
+        assert!(entries.haps.len() > 1000);
+        // In one cycle, and across two.
+        for (begin, end) in [(2003, 2004), (2019, 2021)] {
+            let tick = TimeSpan::new(frac(begin, 20), frac(end, 20));
+            let near = entries.near(tick, 0).expect("the entries near");
+            assert!((1..=14).contains(&near.each().count()), "{tick:?}");
+        }
+    }
+
     #[test]
     fn a_narrow_query_looks_at_its_own_cycle_only() {
         let tick = TimeSpan::new(frac(5003, 20), frac(5004, 20));
@@ -5180,7 +5409,7 @@ mod tests {
             };
             let entries = layer.entries_in(Order::Graph).expect("graph order");
             assert_eq!(
-                entries.near(tick, 0).map(|near| near.haps.len()),
+                entries.near(tick, 0).map(|near| near.count()),
                 Some(per_cycle),
                 "{name}"
             );
