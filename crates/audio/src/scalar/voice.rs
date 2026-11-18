@@ -1347,6 +1347,8 @@ impl ScalarBackend {
         if let (Some(consumer), Some(tag)) = (&mut self.confirmations, confirmation) {
             consumer.admission(tag, musical, generation, false);
         }
+        #[cfg(not(feature = "device-audio"))]
+        let _ = (confirmation, musical, generation);
         true
     }
 
