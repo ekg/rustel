@@ -23,6 +23,13 @@
 //!     public static native void stop(long handle);
 //!     /** Drains pending diagnostics as a JSON array string. */
 //!     public static native String diagnosticsJson(long handle);
+//!     /** Rewrites a score through one OpenAI-compatible chat call:
+//!         `endpoint` is the base URL ahead of /chat/completions, and the
+//!         reply is the complete new score text. Throws with the
+//!         failure's message when the call fails. */
+//!     public static native String llmRewrite(long handle, String endpoint,
+//!                                             String model, String key,
+//!                                             String score, String prompt);
 //!     /** Closes the session and frees the handle. */
 //!     public static native void dispose(long handle);
 //! }
@@ -182,6 +189,50 @@ pub extern "system" fn Java_dev_rustel_android_RustelHost_diagnosticsJson<'local
             Ok(string) => string.into_raw(),
             Err(_) => {
                 throw(&mut env, "the Java heap refused the diagnostics string");
+                std::ptr::null_mut()
+            }
+        },
+        Err(error) => {
+            throw(&mut env, &error);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_rustel_android_RustelHost_llmRewrite<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    endpoint: JString<'local>,
+    model: JString<'local>,
+    key: JString<'local>,
+    score: JString<'local>,
+    prompt: JString<'local>,
+) -> jstring {
+    let Some(host) = host(&mut env, handle) else {
+        return std::ptr::null_mut();
+    };
+    let Some(endpoint) = rust_string(&mut env, endpoint, "llm endpoint") else {
+        return std::ptr::null_mut();
+    };
+    let Some(model) = rust_string(&mut env, model, "llm model") else {
+        return std::ptr::null_mut();
+    };
+    let Some(key) = rust_string(&mut env, key, "llm key") else {
+        return std::ptr::null_mut();
+    };
+    let Some(score) = rust_string(&mut env, score, "score source") else {
+        return std::ptr::null_mut();
+    };
+    let Some(prompt) = rust_string(&mut env, prompt, "llm prompt") else {
+        return std::ptr::null_mut();
+    };
+    match host.llm_rewrite(&endpoint, &model, &key, &score, &prompt) {
+        Ok(score) => match env.new_string(score) {
+            Ok(string) => string.into_raw(),
+            Err(_) => {
+                throw(&mut env, "the Java heap refused the rewritten score string");
                 std::ptr::null_mut()
             }
         },

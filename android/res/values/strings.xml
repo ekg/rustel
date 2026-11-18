@@ -7,4 +7,11 @@
     <string name="stop">Stop</string>
     <string name="status_idle">Ready.</string>
     <string name="diagnostics_idle">Diagnostics appear here after Evaluate.</string>
+    <string name="llm_endpoint_hint">LLM endpoint (base URL)</string>
+    <string name="llm_model_hint">model</string>
+    <string name="llm_key_hint">API key</string>
+    <string name="llm_prompt_hint">Ask a model to rewrite the score…</string>
+    <string name="ask">Ask</string>
+    <string name="ask_failed">Ask failed.</string>
+    <string name="llm_unconfigured">Set the LLM endpoint and model above before asking.</string>
 </resources>

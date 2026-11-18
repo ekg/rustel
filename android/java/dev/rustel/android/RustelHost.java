@@ -54,6 +54,16 @@ public final class RustelHost {
     public static native String diagnosticsJson(long handle);
 
     /**
+     * Rewrites a score through one OpenAI-compatible chat call:
+     * {@code endpoint} is the base URL ahead of {@code /chat/completions},
+     * and the reply is the complete new score text. Throws with the
+     * failure's message when the call fails.
+     */
+    public static native String llmRewrite(long handle, String endpoint,
+                                          String model, String key,
+                                          String score, String prompt);
+
+    /**
      * Closes the session and frees the handle. Only call it when no other
      * call on the handle is running.
      */

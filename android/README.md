@@ -2,17 +2,18 @@
 
 A minimal single-activity Android app that embeds the Rustel engine through
 the `rustel-android-host` native library (`crates/android-host`): edit a
-score, evaluate it, render it to a WAV file in the app's private storage and
-play it back. There is no Gradle involved; a shell script drives the SDK
-tools directly.
+score, evaluate it, render it to a WAV file in the app's private storage,
+play it back, and ask an OpenAI-compatible model to rewrite the score.
+There is no Gradle involved; a shell script drives the SDK tools directly.
 
 The app is deliberately small: one `EditText` with a default score, an
 **Evaluate** button (score → engine diagnostics in a `TextView`), a
 **Render & Play** button (render 8 s of the installed score to
-`files/rustel-render.wav` and play it with `MediaPlayer`), and a **Stop**
-button that stops the playback. All native calls are funnelled through one
-background thread, because the JNI handle borrows the session mutably for
-each call and must never see two calls overlap.
+`files/rustel-render.wav` and play it with `MediaPlayer`), a **Stop**
+button that stops the playback, and the **Ask** flow described below. All
+native calls are funnelled through one background thread, because the JNI
+handle borrows the session mutably for each call and must never see two
+calls overlap.
 
 ## What it runs on
 
@@ -77,6 +78,42 @@ To inspect a render from the host: `adb shell run-as dev.rustel.android
 cat files/rustel-render.wav > render.wav` (the app is debuggable-signed, so
 `run-as` works on a non-release device).
 
+## Asking a model to rewrite the score
+
+Above the buttons sit three small fields - **endpoint** (the base URL
+ahead of `/chat/completions`, for example `https://api.openai.com/v1`),
+**model**, and **API key** - and a **prompt** field with an **Ask**
+button next to the score editor. Any OpenAI-compatible chat endpoint
+works: the hosted APIs, but also a local `ollama serve`, a `llama.cpp`
+server, or the mock server below.
+
+**Ask** sends the current score and the prompt to the model through the
+`rustel-pod-llm` crate (the same client the studio's llm pod uses, with
+the Strudel system prompt), and on success puts the complete rewritten
+score back into the editor and evaluates it through the same path the
+**Evaluate** button uses, so the diagnostics under the buttons show the
+rewritten score's engine output. On failure the diagnostics view shows
+the error text, which names the kind of failure (HTTP status, transport,
+malformed JSON, empty reply); the score in the editor is untouched. The
+**Ask** button is disabled while any native call is in flight, like the
+other buttons.
+
+Caveats:
+
+- **The endpoint, model and key are stored in plaintext** in the app's
+own `SharedPreferences` (`llm` file), because the app has no encrypted
+storage of its own. Anything with access to the app's private data (a
+rooted device, an `adb backup` on older devices) can read the key. Use a
+scrap key for experiments, or keep real keys off this debug-signed app.
+- **Cleartext HTTP is allowed** (`android:usesCleartextTraffic` in the
+manifest), because the interesting local endpoints - the emulator's host
+loopback, a LAN `ollama` or `llama.cpp` server - are plain `http://`.
+Prefer `https://` for real services; with cleartext allowed, a
+man-in-the-middle can read the key and the score traffic.
+- On the emulator, the host machine's loopback is reachable as
+`http://10.0.2.2:<port>`; `127.0.0.1` inside the emulator is the emulator
+itself.
+
 ## Running the headless emulator check
 
 With KVM available and the `system-images;android-34;default;x86_64` image
@@ -101,6 +138,36 @@ The `Rustel` log tag then shows the whole sequence: the native library
 loading, the session opening, the score evaluating, the diagnostics JSON, and
 the rendered WAV byte count.
 
+### The headless LLM check
+
+The Ask flow has its own headless run, on the same pattern: a canned
+OpenAI-compatible server runs on the host, and an intent extra makes the
+activity fill its endpoint, model and prompt fields and press Ask on its
+own. No Termux or touchscreen is involved; the app itself makes the call.
+
+```sh
+# On the host: one canned rewrite, served on 127.0.0.1:8081.
+android/llm-mock-server.py 8081 &
+
+# In the emulator: 10.0.2.2 is the host's loopback.
+adb shell am start -n dev.rustel.android/.MainActivity \
+    --ez dev.rustel.LLM_AUTORUN true \
+    --es dev.rustel.LLM_ENDPOINT http://10.0.2.2:8081 \
+    --es dev.rustel.LLM_MODEL mock-model \
+    --es dev.rustel.LLM_PROMPT "arpeggiate the melody"
+sleep 5
+adb logcat -d -s Rustel
+adb shell uiautomator dump /sdcard/llm-proof.xml
+adb pull /sdcard/llm-proof.xml
+```
+
+The `Rustel` log tag shows `ask: asking mock-model at http://10.0.2.2:8081`
+and `ask: adopted the rewritten score (… chars)`, the mock's own log shows
+the `POST /chat/completions` request, and the dumped UI XML shows the score
+`EditText` holding the mock's rewritten score (its `console.log('rewritten
+by the mock llm')` marker line) and the diagnostics `TextView` carrying the
+engine's evaluation of it - the same evidence a tap on **Ask** produces.
+
 ## Known limits
 
 - The **Stop** button stops the playback, not a render in progress:
@@ -110,3 +177,6 @@ the rendered WAV byte count.
 - The app renders with the bundled `bd` sample and synth voices only; the
   engine's network sample bank is not enabled behind the app's back
   (see `crates/android-host/src/lib.rs`).
+- **Ask is Mode A only**: one rewrite call per prompt, no agent loop. The
+  agent pod (Mode B) remains the studio's Termux path
+  (`docs/studio.md`); the app has no agent mode.

@@ -7,7 +7,7 @@
     package="dev.rustel.android">
 
     <!-- Offline renders need no network, but a score that fetches samples
-         over HTTPS does. -->
+         over HTTPS does, and so does the LLM Ask call. -->
     <uses-permission android:name="android.permission.INTERNET" />
 
     <!-- minSdk 21 is what the built library requires: the
@@ -15,8 +15,14 @@
          libraries (see docs/building.md). -->
     <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="34" />
 
+    <!-- usesCleartextTraffic: local OpenAI-compatible endpoints (the
+         emulator's 10.0.2.2 host loopback, a LAN ollama or llama.cpp
+         server) are plain http, and Android refuses cleartext by default
+         at targetSdk 28+. android/README.md carries the caveat: prefer
+         https for real services. -->
     <application android:label="@string/app_name"
         android:theme="@style/AppTheme"
+        android:usesCleartextTraffic="true"
         android:debuggable="true">
 
         <activity android:name=".MainActivity"

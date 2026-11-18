@@ -1,5 +1,6 @@
 //! Rustel engine host for an Android app: evaluate a score, render it to
-//! WAV bytes in memory, stop, and collect diagnostics.
+//! WAV bytes in memory, stop, collect diagnostics, and ask an
+//! OpenAI-compatible model to rewrite the score.
 //!
 //! The crate is two layers. The core here is plain Rust with no Android
 //! configuration, so it builds and its tests run on the host. The JNI shim
@@ -138,6 +139,34 @@ impl AndroidHost {
         self.ask(|reply| Command::Diagnostics { reply })
     }
 
+    /// Rewrite `score` per `prompt` through one OpenAI-compatible chat call:
+    /// `endpoint` is the base URL ahead of `/chat/completions`, `model` the
+    /// model to name, `key` the caller's API key for the `Authorization`
+    /// header. Returns the complete rewritten score, or the error's message,
+    /// which names the kind of failure: HTTP status, transport, malformed
+    /// JSON, or an empty reply.
+    ///
+    /// The rewrite never touches the session, so it runs on the calling
+    /// thread and does not queue on the worker: an evaluate or render never
+    /// waits behind a network call. The app still runs it on its engine
+    /// thread like every other native call, one call at a time.
+    pub fn llm_rewrite(
+        &self,
+        endpoint: &str,
+        model: &str,
+        key: &str,
+        score: &str,
+        prompt: &str,
+    ) -> Result<String, String> {
+        let endpoint = rustel_pod_llm::Endpoint::new(endpoint, model, key);
+        endpoint
+            .rewrite(
+                rustel_pod_llm::STRUDEL_SYSTEM_PROMPT,
+                &llm_user_message(score, prompt),
+            )
+            .map_err(|error| error.to_string())
+    }
+
     /// Send `command` and wait for its answer. The worker is the only
     /// sender of replies, so a closed channel means it exited; the failure
     /// is reported, not hidden behind a default answer.
@@ -252,6 +281,14 @@ fn diagnostics_json(session: &mut Session) -> Result<String, String> {
         .map_err(|error| format!("could not serialise the diagnostics: {error}"))
 }
 
+/// The user half of the rewrite request: the score as it stands, and the
+/// change the prompt asks for. The system half is the pod-llm crate's
+/// constant, which asks the model to reply with the complete rewritten
+/// score alone. The studio's llm pod sends the same message.
+fn llm_user_message(score: &str, prompt: &str) -> String {
+    format!("The current score:\n\n{score}\n\nThe change: {prompt}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,5 +379,129 @@ mod tests {
             .expect("the host still evaluates");
         host.render_to_wav(0.1, None)
             .expect("the host still renders");
+    }
+
+    /// Serves one canned HTTP reply on a background thread and hands back
+    /// the base URL to call plus a handle that joins to the request the
+    /// client sent, head and body. Modeled on the pod-llm crate's own
+    /// mock server, so the rewrite can be proven on the host without a
+    /// real endpoint.
+    fn serve_once(response: String) -> (String, std::thread::JoinHandle<String>) {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind a loopback listener");
+        let address = listener.local_addr().expect("read the listener's address");
+        let server = std::thread::Builder::new()
+            .name("mock-openai-server".into())
+            .spawn(move || {
+                let (mut stream, _) = listener.accept().expect("the client connects");
+                let mut raw = Vec::new();
+                let head_end = loop {
+                    let mut chunk = [0u8; 4096];
+                    let read = stream.read(&mut chunk).expect("read the request head");
+                    assert!(read > 0, "the client closed before a full head arrived");
+                    raw.extend_from_slice(&chunk[..read]);
+                    if let Some(position) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break position + 4;
+                    }
+                };
+                let head = String::from_utf8_lossy(&raw[..head_end]).into_owned();
+                let content_length = head
+                    .lines()
+                    .find_map(|line| {
+                        line.split_once(':').and_then(|(name, value)| {
+                            name.trim()
+                                .eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().to_owned())
+                        })
+                    })
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(0);
+                while raw.len() < head_end + content_length {
+                    let mut chunk = [0u8; 4096];
+                    let read = stream.read(&mut chunk).expect("read the request body");
+                    assert!(read > 0, "the client closed before a full body arrived");
+                    raw.extend_from_slice(&chunk[..read]);
+                }
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write the canned reply");
+                String::from_utf8_lossy(&raw).into_owned()
+            })
+            .expect("spawn the mock server thread");
+        (format!("http://{address}"), server)
+    }
+
+    /// A complete HTTP/1.1 reply with the given status line and body.
+    fn http_reply(status_line: &str, body: &str) -> String {
+        format!(
+            "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[test]
+    fn an_llm_rewrite_returns_the_models_score() {
+        let content = "console.log('rewritten by the mock');\n$: s(\"bd sd\")\n";
+        let body = serde_json::json!({
+            "choices": [{ "message": { "role": "assistant", "content": content } }],
+        })
+        .to_string();
+        let (base, server) = serve_once(http_reply("HTTP/1.1 200 OK", &body));
+        let host = AndroidHost::new().expect("the session builds");
+        let score = host
+            .llm_rewrite(
+                &base,
+                "test-model",
+                "test-key",
+                "$: s(\"bd\")",
+                "add a snare",
+            )
+            .expect("the rewrite succeeds");
+        assert_eq!(
+            score,
+            "console.log('rewritten by the mock');\n$: s(\"bd sd\")"
+        );
+        let request = server.join().expect("the mock server thread ends");
+        assert!(
+            request.contains("Authorization: Bearer test-key"),
+            "the key travels in the bearer header: {request}"
+        );
+        let body = request
+            .split("\r\n\r\n")
+            .nth(1)
+            .expect("the request has a body");
+        let sent: serde_json::Value = serde_json::from_str(body).expect("the request body is JSON");
+        assert_eq!(
+            sent["messages"][0]["content"],
+            rustel_pod_llm::STRUDEL_SYSTEM_PROMPT
+        );
+        assert_eq!(
+            sent["messages"][1]["content"],
+            "The current score:\n\n$: s(\"bd\")\n\nThe change: add a snare"
+        );
+    }
+
+    #[test]
+    fn a_failed_llm_rewrite_reports_its_kind_and_leaves_the_host_working() {
+        let (base, server) = serve_once(http_reply("HTTP/1.1 500 Internal Server Error", "boom"));
+        let host = AndroidHost::new().expect("the session builds");
+        let error = host
+            .llm_rewrite(
+                &base,
+                "test-model",
+                "test-key",
+                "$: s(\"bd\")",
+                "add a snare",
+            )
+            .expect_err("a 500 fails the rewrite");
+        server.join().expect("the mock server thread ends");
+        assert!(
+            error.contains("HTTP 500"),
+            "the error names the status: {error}"
+        );
+        // The session never saw the failed call, and still answers.
+        host.evaluate(r#"note("c4").s("sine")"#)
+            .expect("the host still evaluates");
     }
 }

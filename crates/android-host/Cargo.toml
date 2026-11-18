@@ -15,6 +15,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 rustel-engine = { path = "../engine", default-features = false, features = ["session", "extensions"] }
+rustel-pod-llm = { path = "../pod-llm" }
 serde_json = "1.0"
 
 # The JNI shim below is the only Android-specific code in the crate; every

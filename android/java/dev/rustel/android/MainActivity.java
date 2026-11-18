@@ -1,6 +1,7 @@
 package dev.rustel.android;
 
 import android.app.Activity;
+import android.content.SharedPreferences;
 import android.media.MediaPlayer;
 import android.os.Bundle;
 import android.util.Log;
@@ -16,14 +17,15 @@ import java.util.concurrent.Executors;
 
 /**
  * The one-screen Rustel app: edit a score, evaluate it, render it to a WAV
- * file in the app's private storage and play that file.
+ * file in the app's private storage, play that file, and ask an
+ * OpenAI-compatible model to rewrite the score.
  *
  * <p>Every native call runs on one background thread, one call at a time:
  * the native handle in {@code crates/android-host/src/jni.rs} borrows the
  * session mutably for each call, so two calls on the same handle must never
  * overlap. {@link #engine} is the single-thread executor that keeps that
- * true; the Evaluate and Render &amp; Play buttons stay disabled while a call
- * is in flight, so calls never queue behind each other either.
+ * true; the Evaluate, Ask and Render &amp; Play buttons stay disabled while
+ * a call is in flight, so calls never queue behind each other either.
  *
  * <p>The engine thread touches no view. Each button reads what it needs from
  * the views on the UI thread, the job runs on the engine thread, and the
@@ -40,6 +42,23 @@ public final class MainActivity extends Activity {
      * flow leaves evidence in logcat without a touchscreen.
      */
     private static final String EXTRA_AUTORUN = "dev.rustel.AUTORUN";
+
+    /** The intent extras of the headless LLM check: LLM_AUTORUN makes the
+     * activity run one Ask on its own, and the other three fill the
+     * endpoint, model and prompt fields first, so the whole flow leaves
+     * evidence in logcat without a touchscreen
+     * (see android/README.md). */
+    private static final String EXTRA_LLM_AUTORUN = "dev.rustel.LLM_AUTORUN";
+    private static final String EXTRA_LLM_ENDPOINT = "dev.rustel.LLM_ENDPOINT";
+    private static final String EXTRA_LLM_MODEL = "dev.rustel.LLM_MODEL";
+    private static final String EXTRA_LLM_PROMPT = "dev.rustel.LLM_PROMPT";
+
+    /** The app's own preferences file for the LLM endpoint, model and key.
+     * They are stored as plaintext; android/README.md carries the caveat. */
+    private static final String LLM_PREFS = "llm";
+    private static final String PREF_ENDPOINT = "endpoint";
+    private static final String PREF_MODEL = "model";
+    private static final String PREF_KEY = "key";
 
     /** How much of the installed score Render &amp; Play renders, in seconds. */
     private static final double RENDER_SECONDS = 8.0;
@@ -58,10 +77,23 @@ public final class MainActivity extends Activity {
      */
     private volatile File pendingPlayback;
 
+    /**
+     * The rewritten score an Ask job wants adopted once it completes. Set
+     * on the engine thread, taken by the completion on the UI thread,
+     * hence volatile. The completion then evaluates it through the same
+     * path the Evaluate button uses.
+     */
+    private volatile String pendingScore;
+
     private EditText scoreView;
+    private EditText endpointView;
+    private EditText modelView;
+    private EditText keyView;
+    private EditText promptView;
     private TextView statusView;
     private TextView diagnosticsView;
     private Button evaluateButton;
+    private Button askButton;
     private Button renderButton;
     private Button stopButton;
 
@@ -91,21 +123,23 @@ public final class MainActivity extends Activity {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
         scoreView = findViewById(R.id.score);
+        endpointView = findViewById(R.id.llm_endpoint);
+        modelView = findViewById(R.id.llm_model);
+        keyView = findViewById(R.id.llm_key);
+        promptView = findViewById(R.id.llm_prompt);
         statusView = findViewById(R.id.status);
         diagnosticsView = findViewById(R.id.diagnostics);
         evaluateButton = findViewById(R.id.evaluate);
+        askButton = findViewById(R.id.ask);
         renderButton = findViewById(R.id.render);
         stopButton = findViewById(R.id.stop);
 
         scoreView.setText(DEFAULT_SCORE);
+        loadLlmConfig();
 
-        evaluateButton.setOnClickListener(v -> {
-            final String source = scoreView.getText().toString();
-            submit("evaluate", h -> {
-                RustelHost.evaluate(h, source);
-                return RustelHost.diagnosticsJson(h);
-            });
-        });
+        evaluateButton.setOnClickListener(v -> evaluate());
+
+        askButton.setOnClickListener(v -> ask());
 
         renderButton.setOnClickListener(v -> renderAndPlay(scoreView.getText()
                 .toString(), "render & play"));
@@ -117,6 +151,90 @@ public final class MainActivity extends Activity {
         if (getIntent().getBooleanExtra(EXTRA_AUTORUN, false)) {
             renderAndPlay(DEFAULT_SCORE, "autorun");
         }
+
+        if (getIntent().getBooleanExtra(EXTRA_LLM_AUTORUN, false)) {
+            llmAutorun();
+        }
+    }
+
+    /** Evaluate the score in the editor and show its diagnostics; the
+     * Ask flow reuses this path once the rewritten score lands. */
+    private void evaluate() {
+        final String source = scoreView.getText().toString();
+        submit("evaluate", h -> {
+            RustelHost.evaluate(h, source);
+            return RustelHost.diagnosticsJson(h);
+        });
+    }
+
+    /**
+     * Ask the configured model to rewrite the score in the editor. On
+     * success the completion adopts the rewritten score and evaluates it
+     * through {@link #evaluate()}; on failure the job's throw reports the
+     * error text through the diagnostics view, like every other job.
+     */
+    private void ask() {
+        final String endpoint = fieldText(endpointView);
+        final String model = fieldText(modelView);
+        final String key = fieldText(keyView);
+        final String prompt = fieldText(promptView);
+        final String score = scoreView.getText().toString();
+        if (endpoint.isEmpty() || model.isEmpty()) {
+            statusView.setText(R.string.ask_failed);
+            diagnosticsView.setText(R.string.llm_unconfigured);
+            return;
+        }
+        saveLlmConfig(endpoint, model, key);
+        Log.i(TAG, "ask: asking " + model + " at " + endpoint);
+        submit("ask", h -> {
+            String rewritten = RustelHost.llmRewrite(h, endpoint, model,
+                    key, score, prompt);
+            pendingScore = rewritten;
+            return "the model rewrote the score";
+        });
+    }
+
+    /** The text of one LLM config or prompt field, trimmed: a pasted URL
+     * or model name should not carry its surrounding whitespace into the
+     * request. */
+    private static String fieldText(EditText view) {
+        return view.getText().toString().trim();
+    }
+
+    /** Fill the LLM config fields from the app's own preferences; Ask
+     * saves them back, so the endpoint, model and key survive restarts. */
+    private void loadLlmConfig() {
+        SharedPreferences prefs = getSharedPreferences(LLM_PREFS, MODE_PRIVATE);
+        endpointView.setText(prefs.getString(PREF_ENDPOINT, ""));
+        modelView.setText(prefs.getString(PREF_MODEL, ""));
+        keyView.setText(prefs.getString(PREF_KEY, ""));
+    }
+
+    private void saveLlmConfig(String endpoint, String model, String key) {
+        getSharedPreferences(LLM_PREFS, MODE_PRIVATE).edit()
+                .putString(PREF_ENDPOINT, endpoint)
+                .putString(PREF_MODEL, model)
+                .putString(PREF_KEY, key)
+                .apply();
+    }
+
+    /** The headless LLM check: fill the endpoint, model and prompt from
+     * the intent extras, then run one Ask so the whole flow leaves
+     * evidence in logcat and on screen without a touchscreen. */
+    private void llmAutorun() {
+        String endpoint = getIntent().getStringExtra(EXTRA_LLM_ENDPOINT);
+        if (endpoint != null && !endpoint.isEmpty()) {
+            endpointView.setText(endpoint);
+        }
+        String model = getIntent().getStringExtra(EXTRA_LLM_MODEL);
+        if (model != null && !model.isEmpty()) {
+            modelView.setText(model);
+        }
+        String prompt = getIntent().getStringExtra(EXTRA_LLM_PROMPT);
+        if (prompt != null && !prompt.isEmpty()) {
+            promptView.setText(prompt);
+        }
+        ask();
     }
 
     /** Evaluate {@code source}, render it and leave the WAV for the
@@ -151,9 +269,9 @@ public final class MainActivity extends Activity {
 
     /**
      * Run one job on the engine thread and show what it answered. While a
-     * job runs the Evaluate and Render &amp; Play buttons are disabled, so
-     * jobs never queue behind each other and the handle sees one call at a
-     * time.
+     * job runs the Evaluate, Ask and Render &amp; Play buttons are disabled,
+     * so jobs never queue behind each other and the handle sees one call
+     * at a time.
      */
     private void submit(String what, EngineJob job) {
         if (busy) {
@@ -186,12 +304,21 @@ public final class MainActivity extends Activity {
                 if (done && playback != null) {
                     play(playback);
                 }
+                String rewritten = pendingScore;
+                pendingScore = null;
+                if (done && rewritten != null) {
+                    scoreView.setText(rewritten);
+                    Log.i(TAG, "ask: adopted the rewritten score ("
+                            + rewritten.length() + " chars)");
+                    evaluate();
+                }
             });
         });
     }
 
     private void setButtonsEnabled(boolean enabled) {
         evaluateButton.setEnabled(enabled);
+        askButton.setEnabled(enabled);
         renderButton.setEnabled(enabled);
     }
 
