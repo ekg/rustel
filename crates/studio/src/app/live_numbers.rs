@@ -445,12 +445,14 @@ mod tests {
     }
 
     /// A function the engine patternifies takes a live number as a control
-    /// does: `pg(0.8)` moves live. A function that takes its number as it is
-    /// keeps the write in the score.
+    /// does: `fast(2)` moves live, and `pg(0.8)` with the extensions. A
+    /// function that takes its number as it is keeps the write in the score.
     #[test]
     fn a_patternified_function_moves_live_and_a_plain_one_does_not() {
         for (source, number, live) in [
+            #[cfg(feature = "extensions")]
             ("$: s(\"sine\").seg(4).pg(0.8)\n", "0.8", true),
+            ("$: s(\"sine\").seg(4).fast(2)\n", "2", true),
             ("$: s(\"sine\").seg(4).ply(3)\n", "3", true),
             ("$: s(\"sine\").seg(4).midi(\"out\", 3)\n", "3", false),
         ] {
@@ -475,7 +477,9 @@ mod tests {
     fn which_calls_take_a_live_number() {
         assert!(takes_a_live_number("lpf", true, 0));
         assert!(!takes_a_live_number("lpf", true, 1));
-        assert!(takes_a_live_number("pg", false, 0));
+        assert!(takes_a_live_number("fast", false, 0));
+        #[cfg(feature = "extensions")]
+        assert!(takes_a_live_number("pg", false, 0), "an extension function");
         assert!(takes_a_live_number("euclid", false, 1));
         assert!(
             !takes_a_live_number("euclid", false, 2),
