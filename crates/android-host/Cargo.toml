@@ -1,0 +1,26 @@
+[package]
+name = "rustel-android-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Rustel engine host for an Android app: a pure-Rust core and a JNI shim"
+
+[lib]
+# The Android app loads the `cdylib` with `System.loadLibrary`; the `rlib`
+# keeps host `cargo test` and any other embedding working, the same split
+# as `rustel-vst3-fixture`.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rustel-engine = { path = "../engine", default-features = false, features = ["session", "extensions"] }
+serde_json = "1.0"
+
+# The JNI shim below is the only Android-specific code in the crate; every
+# other target compiles the core alone.
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+
+[lints]
+workspace = true

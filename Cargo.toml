@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/engine",
+    "crates/android-host",
     "crates/fraction",
     "crates/core",
     "crates/ext",
