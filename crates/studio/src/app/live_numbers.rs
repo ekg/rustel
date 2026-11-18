@@ -199,9 +199,13 @@ impl App {
         text: &str,
     ) -> bool {
         let numbers = self.live_numbers_now(scene);
+        // The running score already plays the value, so this write owes no
+        // auto update. One the typing owed before it is still owed.
+        let update_owed = self.auto_evaluate_due;
         let Some(before) = self.control_edit(vec![(literal.clone(), text.to_owned())]) else {
             return false;
         };
+        self.auto_evaluate_due = update_owed;
         // The write replaces the literal whole, so its own number is placed
         // by hand and the rest follow the write.
         let Some(editor) = self.scenes.get(scene).map(|entry| &entry.editor) else {
@@ -341,6 +345,7 @@ mod tests {
     fn a_rail_moves_the_playing_score_and_leaves_an_unevaluated_edit_alone() {
         let directory = tempfile::tempdir().expect("tempdir");
         let (mut app, installed) = playing_with_an_unevaluated_edit(directory.path());
+        app.ui_settings.auto_evaluate = true;
         let rail = Rect::new(0, 0, 24, 1);
 
         app.drag_knob(0, rail, 4);
@@ -394,6 +399,10 @@ mod tests {
             sent(&app).len(),
             1,
             "a move of a live number evaluates nothing"
+        );
+        assert!(
+            !app.auto_evaluate_due,
+            "nor does the typing pause after it, with auto evaluate on"
         );
         assert_eq!(span(&app), Some(written(&app)), "the cell follows the rail");
         assert!(app.editor().source().contains("seg(16)"));
