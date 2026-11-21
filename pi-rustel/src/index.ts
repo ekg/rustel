@@ -330,6 +330,11 @@ export default function rustelExtension(pi: ExtensionAPI): void {
 
   pi.registerTool({
     name: "rustel_start",
+    // The four tools share one rustel child and the session's single
+    // `live`, so they must run one at a time; pi's default is parallel
+    // execution, which would let two starts race past `ensureNotRunning`
+    // and orphan the first child.
+    executionMode: "sequential",
     label: "Play a Rustel set",
     description:
       "Play a Rustel set live: spawns `rustel play <first score of the set> --watch --score-events` so later rustel_update calls reload the sounding score without restarting audio. Resolves when the opening score is sounding.",
@@ -339,7 +344,7 @@ export default function rustelExtension(pi: ExtensionAPI): void {
       "Use rustel_start to play a Rustel set folder, then rustel_update to rewrite the sounding score; do not spawn rustel through bash when these tools are available.",
     ],
     parameters: START_PARAMS,
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const busy = ensureNotRunning();
       if (busy !== null) {
         return {
@@ -359,6 +364,23 @@ export default function rustelExtension(pi: ExtensionAPI): void {
         return {
           content: [{ type: "text", text: String(error) }],
           details: { outcome: "start-failed" },
+          isError: true,
+        };
+      }
+      // The session can end while the opening score is still awaited -
+      // then session_shutdown has already run with `live` still null and
+      // nothing else would stop this child - so an aborted start stops
+      // itself and never installs the set.
+      if (signal?.aborted) {
+        await set.stop();
+        return {
+          content: [
+            {
+              type: "text",
+              text: "the session ended while the set was starting; the set was stopped",
+            },
+          ],
+          details: { outcome: "start-aborted" },
           isError: true,
         };
       }
@@ -395,6 +417,7 @@ export default function rustelExtension(pi: ExtensionAPI): void {
 
   pi.registerTool({
     name: "rustel_update",
+    executionMode: "sequential",
     label: "Rewrite the sounding score",
     description:
       "Write a new score to the watched file. The engine lints it: an installed save becomes the sounding score, a broken one is refused and the last good score keeps playing. Returns the verdict.",
@@ -422,6 +445,7 @@ export default function rustelExtension(pi: ExtensionAPI): void {
 
   pi.registerTool({
     name: "rustel_stop",
+    executionMode: "sequential",
     label: "Stop the Rustel set",
     description:
       "Stop the live set: one SIGINT stops playback and lets the tail ring out, a second SIGINT skips the wait, and the child is killed only if it ignores both.",
@@ -450,6 +474,7 @@ export default function rustelExtension(pi: ExtensionAPI): void {
 
   pi.registerTool({
     name: "rustel_status",
+    executionMode: "sequential",
     label: "Report the live Rustel set",
     description:
       "Report the live set: whether it runs, the sounding score's decoded source and save index, recent errors, and a bounded ring of recent stream events.",

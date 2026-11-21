@@ -10,6 +10,7 @@ import { join, sep } from "node:path";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
 import { RustelProcess } from "../src/core/rustel.ts";
+import factory from "../src/index.ts";
 
 /** The first candidate that answers `--version`: $RUSTEL_BIN, `rustel` from
  * PATH, then the cargo install root this machine uses. */
@@ -114,6 +115,100 @@ test(
       await live.stop();
     } finally {
       await live.stop();
+      rmSync(setPath, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "a timed-out update leaves no stale waiter behind",
+  { skip: skipWhenAbsent },
+  async () => {
+    const setPath = mkdtempSync(join(tmpdir(), "pi-rustel-integration-"));
+    writeFileSync(join(setPath, "score.strudel"), 's("bd")\n');
+    const live = new RustelProcess();
+    try {
+      await live.start(setPath, { binary: BINARY as string, output: "silent" });
+      const unknown = await live.update('s("bd").slow(2)\n', 1);
+      assert.ok(unknown.outcome === "unknown", JSON.stringify(unknown));
+      // The cleanup is not observable through the public surface (a settled
+      // promise is harmless to re-finish), so the regression test looks at
+      // the waiters the process itself keeps: the timed-out one must go, or
+      // every timed-out update would leak a closure that observe then
+      // visits on every later stream event.
+      const waiters = (live as unknown as { waiters: unknown[] }).waiters;
+      assert.equal(waiters.length, 0, "the timed-out waiter must be removed");
+      // The set still reads the next verdict.
+      const installed = await live.update('s("bd").slow(2)\n');
+      assert.ok(installed.outcome === "installed", JSON.stringify(installed));
+      await live.stop();
+    } finally {
+      await live.stop();
+      rmSync(setPath, { recursive: true, force: true });
+    }
+  },
+);
+
+/** The smallest ExtensionAPI the tool layer needs: capture the registered
+ * tools so a test can call them the way pi would. */
+function stubPi() {
+  const tools = new Map<
+    string,
+    {
+      execute: (
+        toolCallId: string,
+        params: Record<string, unknown>,
+        signal: AbortSignal | undefined,
+        onUpdate: unknown,
+        ctx: unknown,
+      ) => Promise<{
+        isError?: boolean;
+        content: Array<{ type: string; text: string }>;
+      }>;
+    }
+  >();
+  return {
+    tools,
+    registerTool: (definition: { name: string }) =>
+      tools.set(definition.name, definition as never),
+    on: () => {},
+    sendMessage: () => {},
+  };
+}
+
+test(
+  "a start that returns after its signal aborted stops the set",
+  { skip: skipWhenAbsent },
+  async () => {
+    const setPath = mkdtempSync(join(tmpdir(), "pi-rustel-integration-"));
+    writeFileSync(join(setPath, "score.strudel"), 's("bd")\n');
+    const pi = stubPi();
+    factory(pi as unknown as never);
+    const start = pi.tools.get("rustel_start");
+    const status = pi.tools.get("rustel_status");
+    const stop = pi.tools.get("rustel_stop");
+    assert.ok(start !== undefined && status !== undefined && stop !== undefined);
+    const controller = new AbortController();
+    controller.abort();
+    try {
+      const refused = await start.execute(
+        "id",
+        { set: setPath, binary: BINARY, output: "silent" },
+        controller.signal,
+        undefined,
+        { cwd: process.cwd() },
+      );
+      assert.equal(refused.isError, true);
+      assert.match(refused.content[0].text, /the session ended while the set was starting/);
+      // The aborted start must not install the set: shutdown has already
+      // run by now, so nothing else would stop the child.
+      const reported = await status.execute("id", {}, undefined, undefined, {
+        cwd: process.cwd(),
+      });
+      assert.match(reported.content[0].text, /no set was ever started/);
+      await stop.execute("id", {}, undefined, undefined, { cwd: process.cwd() });
+    } finally {
+      await stop.execute("id", {}, undefined, undefined, { cwd: process.cwd() });
       rmSync(setPath, { recursive: true, force: true });
     }
   },

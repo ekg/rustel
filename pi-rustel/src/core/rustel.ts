@@ -499,7 +499,10 @@ export class RustelProcess {
         }
         return false;
       };
-      const timer = setTimeout(() => finish(null), timeoutMs);
+      const timer = setTimeout(() => {
+        this.waiters = this.waiters.filter((kept) => kept !== waiter);
+        finish(null);
+      }, timeoutMs);
       const finish = (result: RustelEvent | null): void => {
         clearTimeout(timer);
         resolve(result);

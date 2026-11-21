@@ -47,9 +47,12 @@ A message that should start a turn is the user's call, not the set's.
 ## Process hygiene
 
 At most one rustel child exists per extension instance, and starting a
-second set is refused while one runs. The child is stopped by the
+second set is refused while one runs. The four tools are registered with
+pi's sequential execution mode, so calls in one assistant message run one
+at a time and cannot race the single child. The child is stopped by the
 `session_shutdown` handler when the session ends, so a set never outlives
-the session. Every buffer the extension keeps over the stream is bounded.
+the session (a start whose session ends before the opening score arrives
+stops itself). Every buffer the extension keeps over the stream is bounded.
 
 ## Design
 

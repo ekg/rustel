@@ -11,6 +11,7 @@ import factory from "../src/index.ts";
 type RegisteredTool = {
   name: string;
   parameters: Record<string, unknown>;
+  executionMode?: string;
   execute: (
     toolCallId: string,
     params: Record<string, unknown>,
@@ -55,6 +56,11 @@ test("the entry registers the four tools and the shutdown handler", async () => 
   );
   assert.ok(pi.handlers.has("session_shutdown"), "session_shutdown must be handled");
   for (const tool of pi.tools.values()) {
+    assert.equal(
+      tool.executionMode,
+      "sequential",
+      `${tool.name} must not run concurrently with the other rustel tools`,
+    );
     const schema = tool.parameters as { type?: string; required?: string[] };
     assert.equal(schema.type, "object", `${tool.name} takes an object`);
     assert.ok(
