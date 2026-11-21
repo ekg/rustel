@@ -1,0 +1,22 @@
+{
+  "name": "pi-rustel",
+  "version": "0.1.0",
+  "description": "A pi extension that gives agents tools to live-code Rustel: play a set, rewrite the sounding score, and hear what the engine did with it.",
+  "type": "module",
+  "private": true,
+  "license": "AGPL-3.0-or-later",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tzfm/rustel",
+    "directory": "pi-rustel"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "test": "node --test test/*.test.ts",
+    "check": "npm test"
+  }
+}
