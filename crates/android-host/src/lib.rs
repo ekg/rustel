@@ -142,9 +142,10 @@ impl AndroidHost {
     /// Rewrite `score` per `prompt` through one OpenAI-compatible chat call:
     /// `endpoint` is the base URL ahead of `/chat/completions`, `model` the
     /// model to name, `key` the caller's API key for the `Authorization`
-    /// header. Returns the complete rewritten score, or the error's message,
-    /// which names the kind of failure: HTTP status, transport, malformed
-    /// JSON, or an empty reply.
+    /// header, and `context` how much of the language reference the request
+    /// carries ([`llm_context_size`] reads the code Java sends). Returns the
+    /// complete rewritten score, or the error's message, which names the kind
+    /// of failure: HTTP status, transport, malformed JSON, or an empty reply.
     ///
     /// The rewrite never touches the session, so it runs on the calling
     /// thread and does not queue on the worker: an evaluate or render never
@@ -157,11 +158,12 @@ impl AndroidHost {
         key: &str,
         score: &str,
         prompt: &str,
+        context: Option<rustel_pod_llm::ContextSize>,
     ) -> Result<String, String> {
         let endpoint = rustel_pod_llm::Endpoint::new(endpoint, model, key);
         endpoint
             .rewrite(
-                rustel_pod_llm::STRUDEL_SYSTEM_PROMPT,
+                &rustel_pod_llm::system_prompt(context, &[]),
                 &llm_user_message(score, prompt),
             )
             .map_err(|error| error.to_string())
@@ -281,12 +283,29 @@ fn diagnostics_json(session: &mut Session) -> Result<String, String> {
         .map_err(|error| format!("could not serialise the diagnostics: {error}"))
 }
 
-/// The user half of the rewrite request: the score as it stands, and the
+/// The user half of the rewrite request: the score as it stands, then the
 /// change the prompt asks for. The system half is the pod-llm crate's
-/// constant, which asks the model to reply with the complete rewritten
-/// score alone. The studio's llm pod sends the same message.
+/// [`rustel_pod_llm::system_prompt`], which asks the model to reply with the
+/// complete rewritten score alone and carries the language reference; the
+/// score and the change come here because they are the only material that
+/// changes between calls. The studio's llm pod sends the same pair.
 fn llm_user_message(score: &str, prompt: &str) -> String {
     format!("The current score:\n\n{score}\n\nThe change: {prompt}")
+}
+
+/// The reference size a JNI caller names: `0` leaves the reference out, `1`
+/// is the one-line sheet and `2` the full one.
+///
+/// Any other code reads as the compact default, which is also what the app
+/// sends when its own switch has never been set: the reference the studio's
+/// llm pod carries by default.
+pub fn llm_context_size(code: i32) -> Option<rustel_pod_llm::ContextSize> {
+    match code {
+        0 => None,
+        1 => Some(rustel_pod_llm::ContextSize::Compact),
+        2 => Some(rustel_pod_llm::ContextSize::Full),
+        _ => Some(rustel_pod_llm::ContextSize::Compact),
+    }
 }
 
 #[cfg(test)]
@@ -456,6 +475,7 @@ mod tests {
                 "test-key",
                 "$: s(\"bd\")",
                 "add a snare",
+                Some(rustel_pod_llm::ContextSize::Compact),
             )
             .expect("the rewrite succeeds");
         assert_eq!(
@@ -472,13 +492,41 @@ mod tests {
             .nth(1)
             .expect("the request has a body");
         let sent: serde_json::Value = serde_json::from_str(body).expect("the request body is JSON");
+        let system = sent["messages"][0]["content"]
+            .as_str()
+            .expect("the system half is text");
+        assert!(
+            system.starts_with(rustel_pod_llm::STRUDEL_SYSTEM_PROMPT),
+            "the instructions lead, as they do in the studio"
+        );
+        assert!(
+            system.contains("- `lpf(frequency)`"),
+            "the compact reference follows them"
+        );
         assert_eq!(
-            sent["messages"][0]["content"],
-            rustel_pod_llm::STRUDEL_SYSTEM_PROMPT
+            system,
+            rustel_pod_llm::system_prompt(Some(rustel_pod_llm::ContextSize::Compact), &[])
         );
         assert_eq!(
             sent["messages"][1]["content"],
             "The current score:\n\n$: s(\"bd\")\n\nThe change: add a snare"
+        );
+    }
+
+    /// The app's reference switch is an int on the JNI boundary: 2 is the
+    /// full sheet, 1 the compact one, 0 the instructions alone.
+    #[test]
+    fn the_jni_context_code_names_a_reference_size() {
+        assert_eq!(llm_context_size(0), None);
+        assert_eq!(
+            llm_context_size(1),
+            Some(rustel_pod_llm::ContextSize::Compact)
+        );
+        assert_eq!(llm_context_size(2), Some(rustel_pod_llm::ContextSize::Full));
+        assert_eq!(
+            llm_context_size(7),
+            Some(rustel_pod_llm::ContextSize::Compact),
+            "a code this host does not know reads as the default"
         );
     }
 
@@ -493,6 +541,7 @@ mod tests {
                 "test-key",
                 "$: s(\"bd\")",
                 "add a snare",
+                Some(rustel_pod_llm::ContextSize::Compact),
             )
             .expect_err("a 500 fails the rewrite");
         server.join().expect("the mock server thread ends");

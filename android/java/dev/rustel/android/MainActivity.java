@@ -6,6 +6,7 @@ import android.media.MediaPlayer;
 import android.os.Bundle;
 import android.util.Log;
 import android.widget.Button;
+import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.TextView;
 
@@ -53,12 +54,16 @@ public final class MainActivity extends Activity {
     private static final String EXTRA_LLM_MODEL = "dev.rustel.LLM_MODEL";
     private static final String EXTRA_LLM_PROMPT = "dev.rustel.LLM_PROMPT";
 
-    /** The app's own preferences file for the LLM endpoint, model and key.
-     * They are stored as plaintext; android/README.md carries the caveat. */
+    /** The app's own preferences file for the LLM endpoint, model, key and
+     * reference switch. They are stored as plaintext; android/README.md
+     * carries the caveat. */
     private static final String LLM_PREFS = "llm";
     private static final String PREF_ENDPOINT = "endpoint";
     private static final String PREF_MODEL = "model";
     private static final String PREF_KEY = "key";
+    /** Whether the rewrite carries the full reference rather than the
+     * compact one. Absent - the first run - reads as the compact default. */
+    private static final String PREF_FULL_REFERENCE = "full_reference";
 
     /** How much of the installed score Render &amp; Play renders, in seconds. */
     private static final double RENDER_SECONDS = 8.0;
@@ -90,6 +95,7 @@ public final class MainActivity extends Activity {
     private EditText modelView;
     private EditText keyView;
     private EditText promptView;
+    private CheckBox fullReferenceView;
     private TextView statusView;
     private TextView diagnosticsView;
     private Button evaluateButton;
@@ -127,6 +133,7 @@ public final class MainActivity extends Activity {
         modelView = findViewById(R.id.llm_model);
         keyView = findViewById(R.id.llm_key);
         promptView = findViewById(R.id.llm_prompt);
+        fullReferenceView = findViewById(R.id.llm_full_reference);
         statusView = findViewById(R.id.status);
         diagnosticsView = findViewById(R.id.diagnostics);
         evaluateButton = findViewById(R.id.evaluate);
@@ -184,11 +191,15 @@ public final class MainActivity extends Activity {
             diagnosticsView.setText(R.string.llm_unconfigured);
             return;
         }
-        saveLlmConfig(endpoint, model, key);
-        Log.i(TAG, "ask: asking " + model + " at " + endpoint);
+        final int context = fullReferenceView.isChecked()
+                ? RustelHost.CONTEXT_FULL : RustelHost.CONTEXT_COMPACT;
+        saveLlmConfig(endpoint, model, key, context);
+        Log.i(TAG, "ask: asking " + model + " at " + endpoint
+                + " with " + (context == RustelHost.CONTEXT_FULL
+                        ? "the full reference" : "the compact reference"));
         submit("ask", h -> {
             String rewritten = RustelHost.llmRewrite(h, endpoint, model,
-                    key, score, prompt);
+                    key, score, prompt, context);
             pendingScore = rewritten;
             return "the model rewrote the score";
         });
@@ -208,13 +219,20 @@ public final class MainActivity extends Activity {
         endpointView.setText(prefs.getString(PREF_ENDPOINT, ""));
         modelView.setText(prefs.getString(PREF_MODEL, ""));
         keyView.setText(prefs.getString(PREF_KEY, ""));
+        // Absent on a first run, and absent reads as the compact default:
+        // the box is unticked, which is what the studio sends by default.
+        fullReferenceView.setChecked(
+                prefs.getBoolean(PREF_FULL_REFERENCE, false));
     }
 
-    private void saveLlmConfig(String endpoint, String model, String key) {
+    private void saveLlmConfig(String endpoint, String model, String key,
+                               int context) {
         getSharedPreferences(LLM_PREFS, MODE_PRIVATE).edit()
                 .putString(PREF_ENDPOINT, endpoint)
                 .putString(PREF_MODEL, model)
                 .putString(PREF_KEY, key)
+                .putBoolean(PREF_FULL_REFERENCE,
+                        context == RustelHost.CONTEXT_FULL)
                 .apply();
     }
 

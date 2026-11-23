@@ -684,6 +684,73 @@ impl PodKind {
 /// keeps it as plain text.
 pub const LLM_KEY_ENV: &str = "RUSTEL_LLM_KEY";
 
+/// How much of the language reference the llm pod's system message carries.
+///
+/// The reference is what tells a model which names this engine installs and
+/// what they take; it is also most of the request, so it is a choice with a
+/// price. Everything but the size is fixed, which is what lets a provider
+/// cache the block: see [`rustel_pod_llm::system_prompt`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LlmContext {
+    /// The instructions alone: the smallest request, and the one that
+    /// shares no cached prefix with either sheet.
+    Off,
+    /// One line per installed name: its signature, its aliases and its
+    /// one-line documentation. About 17k tokens, the default.
+    #[default]
+    Compact,
+    /// Every parameter's type and description as well. About 35k tokens.
+    Full,
+}
+
+impl LlmContext {
+    const LADDER: [Self; 3] = [Self::Off, Self::Compact, Self::Full];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Compact => "compact",
+            Self::Full => "full",
+        }
+    }
+
+    /// The name the preferences file keeps.
+    pub fn key(self) -> &'static str {
+        self.label()
+    }
+
+    pub fn parse(text: &str) -> Self {
+        Self::LADDER
+            .iter()
+            .copied()
+            .find(|context| context.key() == text)
+            .unwrap_or_default()
+    }
+
+    fn step(self, forwards: bool) -> Self {
+        let index = Self::LADDER
+            .iter()
+            .position(|candidate| *candidate == self)
+            .unwrap_or(0);
+        let len = Self::LADDER.len();
+        Self::LADDER[if forwards {
+            (index + 1) % len
+        } else {
+            (index + len - 1) % len
+        }]
+    }
+
+    /// The size the shared assembler knows, or `None` for
+    /// [`Self::Off`]: the instructions alone.
+    pub fn size(self) -> Option<rustel_pod_llm::ContextSize> {
+        match self {
+            Self::Off => None,
+            Self::Compact => Some(rustel_pod_llm::ContextSize::Compact),
+            Self::Full => Some(rustel_pod_llm::ContextSize::Full),
+        }
+    }
+}
+
 /// The agent command template's default: `pi`, the coding agent whose
 /// RPC mode this pod speaks, with no session file, so a fresh agent's
 /// context lasts exactly as long as the studio does. The row is
@@ -1879,6 +1946,14 @@ pub struct UiSettings {
     /// plain text; [`LLM_KEY_ENV`] in the environment wins over it, for
     /// players who would rather not store the key at all.
     pub llm_api_key: String,
+    /// How much of the language reference the llm pod's system message
+    /// carries. Compact by default: the one-line sheet names everything
+    /// the build installs for about half the tokens the full one costs.
+    pub llm_context: LlmContext,
+    /// Files appended verbatim to that system message, when there are any:
+    /// one path, or several separated by colons. A relative path is taken
+    /// from the set folder, the folder the pods run in. Empty by default.
+    pub llm_context_files: String,
     /// The command line the agent pod spawns when the pod kind is
     /// `agent`: a program speaking the RPC protocol (JSONL commands on
     /// stdin, responses and events on stdout), kept alive across
@@ -2078,6 +2153,8 @@ impl Default for UiSettings {
             llm_endpoint: String::new(),
             llm_model: String::new(),
             llm_api_key: String::new(),
+            llm_context: LlmContext::default(),
+            llm_context_files: String::new(),
             agent_command: AGENT_COMMAND_DEFAULT.to_owned(),
             sync_name_from_title: true,
             load_mode: LoadMode::Wait,
@@ -2226,6 +2303,12 @@ enum Row {
     LlmModel,
     /// The API key the llm pod sends; Enter edits it.
     LlmApiKey,
+    /// How much of the language reference the llm pod's system message
+    /// carries, as a ladder: `off`, `compact` or `full`.
+    LlmContext,
+    /// The files appended to that message, one path or several separated by
+    /// colons; Enter edits the list.
+    LlmContextFiles,
     /// The command line the agent pod spawns when the kind is `agent`;
     /// Enter edits it. See `app/pod.rs`.
     AgentCommand,
@@ -2456,6 +2539,8 @@ const ROWS: &[Row] = &[
     Row::LlmEndpoint,
     Row::LlmModel,
     Row::LlmApiKey,
+    Row::LlmContext,
+    Row::LlmContextFiles,
     Row::AgentCommand,
     Row::SyntaxCheck,
     Row::SetsFolder,
@@ -2611,6 +2696,21 @@ pub fn llm_endpoint_row() -> usize {
         .expect("the llm endpoint row is on the first page")
 }
 
+/// The llm context row's place on the General page, for the tests that walk
+/// the sheet to it.
+pub fn llm_context_row() -> usize {
+    ROWS.iter()
+        .position(|row| matches!(row, Row::LlmContext))
+        .expect("the llm context row is on the first page")
+}
+
+/// The llm context files row's place on the General page.
+pub fn llm_context_files_row() -> usize {
+    ROWS.iter()
+        .position(|row| matches!(row, Row::LlmContextFiles))
+        .expect("the llm context files row is on the first page")
+}
+
 /// The agent command row's place on the General page, for the tests that
 /// walk the sheet to it.
 pub fn agent_command_row() -> usize {
@@ -2717,6 +2817,8 @@ impl Row {
             | Self::LlmEndpoint
             | Self::LlmModel
             | Self::LlmApiKey
+            | Self::LlmContext
+            | Self::LlmContextFiles
             | Self::AgentCommand => "Live coding",
 
             // The one latency knob: what the OUTPUT costs is a
@@ -2790,6 +2892,8 @@ impl Row {
             Self::LlmEndpoint => "llm endpoint",
             Self::LlmModel => "llm model",
             Self::LlmApiKey => "llm key",
+            Self::LlmContext => "llm context",
+            Self::LlmContextFiles => "llm context files",
             Self::AgentCommand => "agent command",
             Self::LoadMode => "load mode",
             Self::Animation => "visualizers",
@@ -2886,6 +2990,12 @@ impl Row {
             Self::LlmModel => "the model the rewrite request names \u{b7} Enter edits it",
             Self::LlmApiKey => {
                 "stored as plain text in the preferences \u{b7} RUSTEL_LLM_KEY in the environment wins over it"
+            }
+            Self::LlmContext => {
+                "the language reference the model is told \u{b7} off sends the instructions alone"
+            }
+            Self::LlmContextFiles => {
+                "files appended to that reference \u{b7} editing them invalidates the cached prefix \u{b7} Enter edits it"
             }
             Self::AgentCommand => {
                 "the RPC agent the prompt talks to \u{b7} one process, alive across prompts \u{b7} Enter edits it"
@@ -3237,6 +3347,8 @@ pub enum SettingsAction {
     EditLlmModel,
     /// Enter on the llm key row: the sheet hands over to a prompt.
     EditLlmApiKey,
+    /// Enter on the llm context files row: the sheet hands over to a prompt.
+    EditLlmContextFiles,
     /// Enter on the agent command row: the sheet hands over to a prompt.
     EditAgentCommand,
     EditVimMappingsPath,
@@ -3999,6 +4111,7 @@ impl SettingsSheet {
                     settings.external_changes = settings.external_changes.step(forwards);
                 }
                 Row::PodKind => settings.pod_kind = settings.pod_kind.step(forwards),
+                Row::LlmContext => settings.llm_context = settings.llm_context.step(forwards),
                 Row::LoadMode => settings.load_mode = settings.load_mode.step(),
                 Row::Animation => set_switch(&mut settings.animation),
                 Row::Highlights => set_switch(&mut settings.highlights),
@@ -4092,6 +4205,7 @@ impl SettingsSheet {
                 | Row::LlmEndpoint
                 | Row::LlmModel
                 | Row::LlmApiKey
+                | Row::LlmContextFiles
                 | Row::AgentCommand
                 | Row::CacheDefaults
                 | Row::RefreshSources
@@ -4177,6 +4291,9 @@ impl SettingsSheet {
                     None if row == Some(&Row::LlmEndpoint) => SettingsAction::EditLlmEndpoint,
                     None if row == Some(&Row::LlmModel) => SettingsAction::EditLlmModel,
                     None if row == Some(&Row::LlmApiKey) => SettingsAction::EditLlmApiKey,
+                    None if row == Some(&Row::LlmContextFiles) => {
+                        SettingsAction::EditLlmContextFiles
+                    }
                     None if row == Some(&Row::AgentCommand) => SettingsAction::EditAgentCommand,
                     None if row == Some(&Row::RecordingsFolder) => {
                         SettingsAction::ChooseRecordingsFolder

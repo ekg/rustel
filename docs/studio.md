@@ -464,7 +464,7 @@ to a bounded tail (the last 200 lines and 64 KB).
 #### The llm pod
 
 The llm pod makes one OpenAI-compatible chat call and takes the reply as the
-complete rewritten score. Three rows configure it, beside the kind row:
+complete rewritten score. Five rows configure it, beside the kind row:
 
 - **llm endpoint** - the base URL ahead of `/chat/completions`, for example
   `https://api.openai.com/v1` or a local server's `http://127.0.0.1:8080/v1`.
@@ -472,14 +472,42 @@ complete rewritten score. Three rows configure it, beside the kind row:
 - **llm model** - the model the request names. Enter edits it.
 - **llm key** - the API key, sent only in the request's `Authorization`
   header. Enter edits it; the row never shows the whole key.
+- **llm context** - how much of the language reference the model is told:
+  `off` sends the instructions alone, `compact` (the default) sends one line
+  per name the build installs, and `full` adds every parameter's type and
+  description. About 17k tokens for `compact` and 35k for `full` on a
+  complete build. Left and right step it.
+- **llm context files** - files appended verbatim after that reference: one
+  path, or several separated by colons. A relative path is taken from the set
+  folder, so a set can carry its own documentation. Enter edits the list.
 
 The key can also come from the `RUSTEL_LLM_KEY` environment variable, which
 wins over the stored row. That is the way to keep a key out of the
 preferences file, because the stored row is plain text at rest: anything
 that can read `studio.json` can read the key.
 
-Submitting a prompt sends the rewrite on a background thread - the core's
-system prompt, the active tab's current score, and your prompt - and the call
+#### What the model is told
+
+The system message is the rewrite instructions and then the language
+reference of the build that is running: every name this engine installs,
+under its heading, with the signature, the aliases and a one-line
+description. The sheet is generated from the same tables the reference panel
+reads, so it cannot drift from the engine a score will run on, and a model
+told about `lpf` or `_pianoroll` has no reason to invent a name that does not
+exist.
+
+The block is the same bytes on every call. Nothing in it comes from the
+score, the prompt, the clock or the host, which is what lets a provider's
+prefix cache reuse it: the cached part of a request is billed at a fraction
+of the input price, and only the score and the change are new each time -
+they travel after the reference, in the user message. Editing the **llm
+context** row, editing a file that **llm context files** names, or upgrading
+Rustel changes the prefix, and the first call after that pays for the whole
+message again. A document that `llm context files` names but cannot read is
+left out and said in the Log under `pod`; the rewrite still goes.
+
+Submitting a prompt sends the rewrite on a background thread - that system
+message, the active tab's current score, and your prompt - and the call
 is bounded by a sixty-second timeout. On success the returned score replaces
 the active tab's text, is written to its file, and is evaluated like an
 update: no external-changes setting is needed, because the pane is Studio's

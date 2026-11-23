@@ -937,6 +937,13 @@ impl App {
                 self.sync_settings_webcam_preview();
                 return true;
             }
+            SettingsAction::EditLlmContextFiles => {
+                self.settings_sheet = Some(sheet);
+                self.open_pod_prompt(super::pod::PodPromptKind::ContextFiles);
+                #[cfg(feature = "hydra")]
+                self.sync_settings_webcam_preview();
+                return true;
+            }
             // The sheet hands over to the agent command's own prompt, the
             // same way: over the sheet, back to it on Esc.
             SettingsAction::EditAgentCommand => {
@@ -2169,7 +2176,7 @@ mod tests {
             // Down to the machine rows at the page's end, onto max
             // polyphony: past the set rows, the load mode and the output
             // buffer.
-            for _ in 0..21 {
+            for _ in 0..23 {
                 press(&mut app, KeyCode::Down, KeyModifiers::NONE);
             }
             press(&mut app, KeyCode::Right, KeyModifiers::NONE);
@@ -2192,7 +2199,7 @@ mod tests {
             app.settings_sheet = Some(sheet);
             app.focus = Focus::Panel(PanelKind::Settings);
             // Down onto the load mode, past the set rows.
-            for _ in 0..19 {
+            for _ in 0..21 {
                 press(&mut app, KeyCode::Down, KeyModifiers::NONE);
             }
             press(&mut app, KeyCode::Right, KeyModifiers::NONE);

@@ -24,12 +24,15 @@
 //!     /** Drains pending diagnostics as a JSON array string. */
 //!     public static native String diagnosticsJson(long handle);
 //!     /** Rewrites a score through one OpenAI-compatible chat call:
-//!         `endpoint` is the base URL ahead of /chat/completions, and the
-//!         reply is the complete new score text. Throws with the
-//!         failure's message when the call fails. */
+//!         `endpoint` is the base URL ahead of /chat/completions, `context`
+//!         is the language reference to send (0 none, 1 the one-line
+//!         sheet, 2 the full one; any other code reads as 1), and the reply
+//!         is the complete new score text. Throws with the failure's
+//!         message when the call fails. */
 //!     public static native String llmRewrite(long handle, String endpoint,
 //!                                             String model, String key,
-//!                                             String score, String prompt);
+//!                                             String score, String prompt,
+//!                                             int context);
 //!     /** Closes the session and frees the handle. */
 //!     public static native void dispose(long handle);
 //! }
@@ -45,10 +48,10 @@ use std::path::PathBuf;
 use jni::{
     JNIEnv,
     objects::{JClass, JString},
-    sys::{jbyteArray, jdouble, jlong, jstring},
+    sys::{jbyteArray, jdouble, jint, jlong, jstring},
 };
 
-use crate::AndroidHost;
+use crate::{AndroidHost, llm_context_size};
 
 /// Borrow the host a handle names, or throw and answer nothing. A zero or
 /// stale handle is a Java-side bug; the exports report it as an exception
@@ -209,6 +212,7 @@ pub extern "system" fn Java_dev_rustel_android_RustelHost_llmRewrite<'local>(
     key: JString<'local>,
     score: JString<'local>,
     prompt: JString<'local>,
+    context: jint,
 ) -> jstring {
     let Some(host) = host(&mut env, handle) else {
         return std::ptr::null_mut();
@@ -228,7 +232,14 @@ pub extern "system" fn Java_dev_rustel_android_RustelHost_llmRewrite<'local>(
     let Some(prompt) = rust_string(&mut env, prompt, "llm prompt") else {
         return std::ptr::null_mut();
     };
-    match host.llm_rewrite(&endpoint, &model, &key, &score, &prompt) {
+    match host.llm_rewrite(
+        &endpoint,
+        &model,
+        &key,
+        &score,
+        &prompt,
+        llm_context_size(context),
+    ) {
         Ok(score) => match env.new_string(score) {
             Ok(string) => string.into_raw(),
             Err(_) => {

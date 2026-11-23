@@ -19,6 +19,15 @@ public final class RustelHost {
      * argument: {@code <dir>/rustel-render.wav}. */
     public static final String RENDER_WAV_NAME = "rustel-render.wav";
 
+    /** The language reference {@link #llmRewrite} sends: none, the one-line
+     * sheet, or the same sheet with every parameter. The codes are the
+     * native host's own (see {@code llm_context_size} in
+     * {@code crates/android-host/src/lib.rs}); compact is the default the
+     * studio's llm pod sends. */
+    public static final int CONTEXT_OFF = 0;
+    public static final int CONTEXT_COMPACT = 1;
+    public static final int CONTEXT_FULL = 2;
+
     static {
         System.loadLibrary("rustel_android_host");
         Log.i(TAG, "rustel_android_host loaded");
@@ -56,12 +65,15 @@ public final class RustelHost {
     /**
      * Rewrites a score through one OpenAI-compatible chat call:
      * {@code endpoint} is the base URL ahead of {@code /chat/completions},
+     * {@code context} is the language reference to send ({@link
+     * #CONTEXT_OFF}, {@link #CONTEXT_COMPACT} or {@link #CONTEXT_FULL}),
      * and the reply is the complete new score text. Throws with the
      * failure's message when the call fails.
      */
     public static native String llmRewrite(long handle, String endpoint,
                                           String model, String key,
-                                          String score, String prompt);
+                                          String score, String prompt,
+                                          int context);
 
     /**
      * Closes the session and frees the handle. Only call it when no other

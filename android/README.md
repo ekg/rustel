@@ -98,6 +98,20 @@ malformed JSON, empty reply); the score in the editor is untouched. The
 **Ask** button is disabled while any native call is in flight, like the
 other buttons.
 
+What the model is told about the language is the reference of the build the
+app carries: every name the engine installs, with its signature and a
+one-line description, generated from the same tables the studio's reference
+panel reads. The **full reference** checkbox under the prompt chooses between
+that one-line sheet - unticked, the default, and what a fresh install sends -
+and the same sheet with every parameter's type and description. The choice
+is saved with the endpoint, model and key.
+
+The reference is the same bytes on every call, and only the score and the
+prompt change between them, which is what a provider's prefix cache reuses:
+the cached part of a request is billed at a fraction of the input price.
+Ticking or unticking **full reference**, or installing a new build, changes
+the prefix, and the first call after that pays for the whole message again.
+
 Caveats:
 
 - **The endpoint, model and key are stored in plaintext** in the app's

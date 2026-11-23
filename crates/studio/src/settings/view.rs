@@ -137,6 +137,15 @@ impl Widget for SettingsSheetView<'_> {
                 }
                 // Never the whole key: the sheet is read over shoulders.
                 Row::LlmApiKey => llm_key_readout(&self.settings.llm_api_key),
+                Row::LlmContext => self.settings.llm_context.label().to_owned(),
+                Row::LlmContextFiles => {
+                    let files = self.settings.llm_context_files.trim();
+                    if files.is_empty() {
+                        "not set".to_owned()
+                    } else {
+                        files.to_owned()
+                    }
+                }
                 // A template row again: the default is the shipped `pi`
                 // command line, and `not set` is the agent pod refused.
                 Row::AgentCommand => {

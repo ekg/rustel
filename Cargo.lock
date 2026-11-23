@@ -4608,6 +4608,7 @@ version = "0.1.7"
 name = "rustel-pod-llm"
 version = "0.1.7"
 dependencies = [
+ "rustel-runtime",
  "serde",
  "serde_json",
  "ureq",

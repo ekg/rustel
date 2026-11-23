@@ -10,20 +10,27 @@
 //!
 //! The crate holds no key of its own: [`Endpoint`] carries the caller's key
 //! and sends it only in the `Authorization: Bearer` header of the request.
+//!
+//! [`system_prompt`] assembles the other half of the request - the
+//! instructions, the language reference this build installs, and any
+//! documents the player added - as one block that does not change between
+//! calls.
 
 use std::fmt;
 use std::io::Read;
 use std::time::Duration;
 
+use rustel_runtime::reference::{SheetDetail, cheat_sheet};
 use serde::Deserialize;
 
-/// The system prompt for a Strudel score rewrite.
+/// The system prompt for a Strudel score rewrite: the instructions alone.
 ///
 /// The contract it asks the model for, and [`clean_score`] enforces on the
 /// way back: the reply is the complete rewritten score alone, with no code
-/// fence and no commentary. Pass this as the `system` half of
-/// [`Endpoint::rewrite`]; the `user` half names the current score and the
-/// requested change.
+/// fence and no commentary. [`system_prompt`] is this text plus the
+/// language reference; a caller that wants no reference at all passes this
+/// constant as the `system` half of [`Endpoint::rewrite`]. The `user` half
+/// names the current score and the requested change.
 pub const STRUDEL_SYSTEM_PROMPT: &str = "\
 You rewrite Rustel score files. Rustel is a native Rust audio engine for
 the Strudel pattern language: a score is JavaScript that builds patterns,
@@ -35,6 +42,74 @@ fences, no commentary, no explanation of the edit. The reply must be a
 full, valid score on its own, not a fragment or a diff. Where the request
 does not ask for a change, keep the current score's style, structure and
 wording.";
+
+/// How much of the language reference the system message carries.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ContextSize {
+    /// One line per name: its signature, its aliases and its one-line
+    /// documentation. About 68 kB (17k tokens at four bytes a token) on the
+    /// complete product build.
+    #[default]
+    Compact,
+    /// The same lines, then every parameter's type and description - where a
+    /// default is read. About 140 kB (35k tokens) on the same build.
+    Full,
+}
+
+impl ContextSize {
+    /// The detail the shared renderer prints for this size.
+    fn detail(self) -> SheetDetail {
+        match self {
+            Self::Compact => SheetDetail::Line,
+            Self::Full => SheetDetail::Params,
+        }
+    }
+
+    /// The one line that separates the instructions from the reference, and
+    /// says what the list after it is. A build prints the same words every
+    /// time, which is what keeps the prefix cacheable.
+    fn header(self) -> &'static str {
+        match self {
+            Self::Compact => {
+                "Reference: the names this Rustel build installs, one line each, \
+                 with the signature and a one-line description:"
+            }
+            Self::Full => {
+                "Reference: the names this Rustel build installs, one line each, \
+                 with the signature, a one-line description and every parameter:"
+            }
+        }
+    }
+}
+
+/// The whole system message for one rewrite: [`STRUDEL_SYSTEM_PROMPT`], then
+/// the language reference for `size` when there is one, then `documents` -
+/// the player's own files, verbatim, in the order given.
+///
+/// Everything here is a function of the build and of these two arguments,
+/// never of the call: no clock, no paths, no score, no prompt. That is what
+/// makes the message a cacheable prefix. Providers cache the longest prefix
+/// of a request that repeats an earlier one, and bill the cached rest at a
+/// fraction of the input price; a prefix that changes between calls is a
+/// cache that never hits, so all the per-call material - the current score
+/// and the requested change - belongs in the user message, after this one.
+///
+/// `None` leaves the reference block out and an empty `documents` adds
+/// nothing, so either absence leaves the rest of the message as it was.
+pub fn system_prompt(size: Option<ContextSize>, documents: &[String]) -> String {
+    let mut prompt = STRUDEL_SYSTEM_PROMPT.to_owned();
+    if let Some(size) = size {
+        prompt.push_str("\n\n");
+        prompt.push_str(size.header());
+        prompt.push_str("\n\n");
+        prompt.push_str(&cheat_sheet(size.detail()));
+    }
+    for document in documents {
+        prompt.push_str("\n\n");
+        prompt.push_str(document);
+    }
+    prompt
+}
 
 /// One rewrite gets at most this long: connect, send, and read combined.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -126,9 +201,10 @@ impl Endpoint {
     }
 
     /// Rewrites a score in one call: `system` is the instruction
-    /// ([`STRUDEL_SYSTEM_PROMPT`] for a Strudel rewrite), `user` names the
-    /// current score and the requested change. Returns the cleaned assistant
-    /// text, a complete score.
+    /// ([`system_prompt`] for a Strudel rewrite, or [`STRUDEL_SYSTEM_PROMPT`]
+    /// for the instructions alone), `user` names the current score and the
+    /// requested change. Returns the cleaned assistant text, a complete
+    /// score.
     pub fn rewrite(&self, system: &str, user: &str) -> Result<String, PodLlmError> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         // ureq's default connect timeout is thirty seconds; set both ends of
@@ -348,6 +424,109 @@ mod tests {
         let endpoint = Endpoint::new("http://127.0.0.1:9", "test-model", "key");
         let body = endpoint.request_body("system text", "user text");
         assert!(body.get("temperature").is_none());
+    }
+
+    /// The cache invariant: the same settings give the same bytes, so the
+    /// prefix a provider cached for one call is the prefix of the next.
+    #[test]
+    fn the_system_prompt_is_the_same_bytes_on_every_call() {
+        for size in [ContextSize::Compact, ContextSize::Full] {
+            assert_eq!(
+                system_prompt(Some(size), &[]),
+                system_prompt(Some(size), &[]),
+                "{size:?} is a function of the build alone"
+            );
+        }
+        // Without a reference and without documents the message is the
+        // instructions, byte for byte.
+        assert_eq!(system_prompt(None, &[]), STRUDEL_SYSTEM_PROMPT);
+    }
+
+    /// The two sizes are the two sheets: the instructions first, then the
+    /// reference, one line per name against every parameter too.
+    #[test]
+    fn both_sizes_open_with_the_instructions_and_differ() {
+        let compact = system_prompt(Some(ContextSize::Compact), &[]);
+        let full = system_prompt(Some(ContextSize::Full), &[]);
+        for prompt in [&compact, &full] {
+            assert!(
+                prompt.starts_with(STRUDEL_SYSTEM_PROMPT),
+                "the instructions lead: {}",
+                &prompt[..80.min(prompt.len())]
+            );
+            assert!(
+                prompt.contains("- `lpf(frequency)`"),
+                "a name every build of the engine installs is in the reference"
+            );
+        }
+        assert_ne!(compact, full, "the sizes are different sheets");
+        assert_eq!(ContextSize::default(), ContextSize::Compact);
+        assert!(
+            full.len() > compact.len(),
+            "the full sheet carries more: {} against {}",
+            full.len(),
+            compact.len()
+        );
+        assert!(
+            full.matches("\n  - `").count() > 0 && !compact.contains("\n  - `"),
+            "only the full sheet prints a parameter line for each entry"
+        );
+    }
+
+    /// A document - a player's own reference file - lands after the sheet,
+    /// and its absence leaves every earlier byte as it was.
+    #[test]
+    fn a_document_lands_after_the_sheet_and_changes_nothing_else() {
+        let documents = ["The house style: two bars, then a break.".to_owned()];
+        let without = system_prompt(Some(ContextSize::Compact), &[]);
+        let with = system_prompt(Some(ContextSize::Compact), &documents);
+        assert!(
+            with.starts_with(&without),
+            "the block before the document is untouched"
+        );
+        assert_eq!(with[without.len()..].trim_start(), documents[0]);
+        assert!(
+            with.find(&documents[0]) > with.find("## "),
+            "the document follows the sheet's sections"
+        );
+    }
+
+    /// The whole request as the endpoint sees it: the system half opens with
+    /// the instructions and carries the reference, and the user half keeps
+    /// only the score and the change.
+    #[test]
+    fn the_request_carries_the_reference_and_the_user_turn_carries_the_score() {
+        let system = system_prompt(Some(ContextSize::Compact), &[]);
+        let (base, server) = serve_once(openai_reply("$: s(\"bd sd\")\n"));
+        let score = Endpoint::new(base, "test-model", "test-key")
+            .rewrite(
+                &system,
+                "The current score:\n\n$: s(\"bd\")\n\nThe change: four",
+            )
+            .expect("the rewrite succeeds");
+        assert_eq!(score, "$: s(\"bd sd\")");
+        let request = server.join().expect("the mock server thread ends");
+        let body = request
+            .split("\r\n\r\n")
+            .nth(1)
+            .expect("the request has a body");
+        let sent: serde_json::Value = serde_json::from_str(body).expect("the request body is JSON");
+        let sent_system = sent["messages"][0]["content"]
+            .as_str()
+            .expect("the system half is text");
+        assert!(sent_system.starts_with(STRUDEL_SYSTEM_PROMPT));
+        assert!(sent_system.contains("- `lpf(frequency)`"));
+        let sent_user = sent["messages"][1]["content"]
+            .as_str()
+            .expect("the user half is text");
+        assert_eq!(
+            sent_user, "The current score:\n\n$: s(\"bd\")\n\nThe change: four",
+            "the score and the change, in that order"
+        );
+        assert!(
+            !sent_user.contains("Reference:") && !sent_user.contains("lpf"),
+            "no part of the documentation travels in the user turn"
+        );
     }
 
     #[test]

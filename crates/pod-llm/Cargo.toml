@@ -8,6 +8,11 @@ publish = false
 description = "OpenAI-compatible single-call score rewriter for Rustel pods"
 
 [dependencies]
+# The language reference these pods hand a model is the runtime's own:
+# every name it lists is installed by the build this crate is linked into,
+# so no table is copied here. Most hosts that call this crate already link
+# the runtime; the pod crate never links the studio.
+rustel-runtime = { path = "../runtime", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
 # The same rustls-backed ureq the runtime uses for its fetches; the `json`

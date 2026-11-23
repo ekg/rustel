@@ -534,7 +534,7 @@ mod tests {
             assert_eq!(app.focus, Focus::Panel(PanelKind::Settings));
             // Down to the local prebake row, past the set rows and the
             // global prebake above it.
-            for _ in 0..15 {
+            for _ in 0..17 {
                 press(&mut app, KeyCode::Down, KeyModifiers::NONE);
             }
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE);

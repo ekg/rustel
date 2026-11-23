@@ -72,6 +72,14 @@
             android:text="@string/ask" />
     </LinearLayout>
 
+    <CheckBox
+        android:id="@+id/llm_full_reference"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:paddingTop="4dp"
+        android:text="@string/llm_full_reference"
+        android:textSize="12sp" />
+
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"

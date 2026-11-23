@@ -39,10 +39,11 @@
 //! pod needs no watch: the studio itself wrote what it adopted, so the
 //! reply goes into the tab it came from, its file takes it, and it is
 //! evaluated like an update - the studio-internal path, whatever the
-//! watch row says. The llm pod's request is the core crate's system
-//! prompt, the active tab's current score, and the player's prompt; a
-//! failure keeps the editor untouched and lands in the log under `pod`,
-//! its message naming the kind of failure.
+//! watch row says. The llm pod's request is the pod crate's system
+//! prompt with the language reference behind it, then the active tab's
+//! current score and the player's prompt; a failure keeps the editor
+//! untouched and lands in the log under `pod`, its message naming the
+//! kind of failure.
 //!
 //! A pod's own words - the command's streams, each line as it completes -
 //! go to the log under `pod` through the same bounded capture, and a
@@ -129,6 +130,9 @@ pub(super) enum PodPromptKind {
     Model,
     /// The llm key row's API key, from Enter on its settings row.
     Key,
+    /// The llm context files row's list of paths, from Enter on its
+    /// settings row.
+    ContextFiles,
     /// The agent command row's command line, from Enter on its settings
     /// row.
     AgentCommand,
@@ -143,6 +147,7 @@ impl PodPromptKind {
             Self::Endpoint => " llm endpoint ",
             Self::Model => " llm model ",
             Self::Key => " llm key ",
+            Self::ContextFiles => " llm context files ",
             Self::AgentCommand => " agent command ",
         }
     }
@@ -157,6 +162,7 @@ impl PodPromptKind {
             Self::Endpoint => Some("llm endpoint"),
             Self::Model => Some("llm model"),
             Self::Key => Some("llm key"),
+            Self::ContextFiles => Some("llm context files"),
             Self::AgentCommand => Some("agent command"),
         }
     }
@@ -166,7 +172,7 @@ impl PodPromptKind {
         match self {
             Self::Request => MAX_REQUEST_CHARS,
             Self::Command | Self::AgentCommand => MAX_COMMAND_CHARS,
-            Self::Endpoint | Self::Model | Self::Key => MAX_CONFIG_CHARS,
+            Self::Endpoint | Self::Model | Self::Key | Self::ContextFiles => MAX_CONFIG_CHARS,
         }
     }
 }
@@ -299,10 +305,12 @@ fn request_refusal(settings: &UiSettings) -> Option<String> {
     }
 }
 
-/// The user half of the rewrite request: the score as it stands, and
-/// the change the prompt asks for. The system half is the core crate's
-/// constant, which asks the model to reply with the complete rewritten
-/// score alone.
+/// The user half of the rewrite request: the score as it stands, then the
+/// change the prompt asks for, in that order. The system half is
+/// [`rustel_pod_llm::system_prompt`], which asks the model to reply with the
+/// complete rewritten score alone and carries the language reference; the
+/// score and the change are here because they are the only per-call
+/// material, and a cached prefix must end before them.
 fn llm_user_message(score: &str, prompt: &str) -> String {
     format!("The current score:\n\n{score}\n\nThe change: {prompt}")
 }
@@ -624,6 +632,7 @@ impl App {
             PodPromptKind::Endpoint => self.ui_settings.llm_endpoint.clone(),
             PodPromptKind::Model => self.ui_settings.llm_model.clone(),
             PodPromptKind::Key => self.ui_settings.llm_api_key.clone(),
+            PodPromptKind::ContextFiles => self.ui_settings.llm_context_files.clone(),
             PodPromptKind::Request => String::new(),
         };
         let cursor = text.len();
@@ -669,6 +678,10 @@ impl App {
             }
             PodPromptKind::Key => {
                 "llm key - Enter keeps \u{b7} RUSTEL_LLM_KEY in the environment wins over it \u{b7} Esc closes"
+                    .into()
+            }
+            PodPromptKind::ContextFiles => {
+                "llm context files - one path or several separated by colons, from the set folder \u{b7} appending them invalidates the provider's cached prefix \u{b7} Enter keeps \u{b7} Esc closes"
                     .into()
             }
             PodPromptKind::AgentCommand => {
@@ -863,6 +876,7 @@ impl App {
             PodPromptKind::Endpoint => self.ui_settings.llm_endpoint = text.clone(),
             PodPromptKind::Model => self.ui_settings.llm_model = text.clone(),
             PodPromptKind::Key => self.ui_settings.llm_api_key = text.clone(),
+            PodPromptKind::ContextFiles => self.ui_settings.llm_context_files = text.clone(),
             PodPromptKind::Request => unreachable!("a request keeps nothing"),
         }
         self.prefs.set_ui_settings(&self.ui_settings);
@@ -967,6 +981,33 @@ impl App {
         }
     }
 
+    /// The documents the `llm context files` row names: each path read
+    /// whole, in the order written, for
+    /// [`rustel_pod_llm::system_prompt`] to append after the reference. A
+    /// relative path is taken from `set`, the folder the pods run in, so a
+    /// set can carry its own documentation. A file that does not read is
+    /// left out and said in the log under `pod`: the rewrite is about the
+    /// score, and a missing document must not stop it.
+    fn llm_context_documents(&mut self, set: &Path) -> Vec<String> {
+        let files = self.ui_settings.llm_context_files.clone();
+        let mut documents = Vec::new();
+        for path in files
+            .split(':')
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+        {
+            match std::fs::read_to_string(set.join(path)) {
+                Ok(text) => documents.push(text),
+                Err(error) => self.log.push(
+                    LogLevel::Warn,
+                    "pod",
+                    format!("llm context file {path} could not be read: {error}"),
+                ),
+            }
+        }
+        documents
+    }
+
     /// Ask the configured llm endpoint for a rewrite of the active tab's
     /// score, on the pod's background thread. The answer comes back
     /// through [`App::pump_pod`], the way a command pod's lines do.
@@ -997,6 +1038,16 @@ impl App {
         }
         let scene_id = scene.id;
         let score = scene.editor.source();
+        // The two halves of the request, kept apart on purpose: the system
+        // half is the instructions, the reference the llm context row
+        // chooses, and the player's own documents, and none of it changes
+        // between calls - which is what a provider's prefix cache reuses.
+        // The score and the change are this call's own material, so they
+        // travel in the user half, after it.
+        let set = std::path::absolute(self.scenes.directory())
+            .unwrap_or_else(|_| self.scenes.directory().to_path_buf());
+        let documents = self.llm_context_documents(&set);
+        let system = rustel_pod_llm::system_prompt(self.ui_settings.llm_context.size(), &documents);
         let user = llm_user_message(&score, prompt);
         let endpoint = rustel_pod_llm::Endpoint::new(endpoint, model.clone(), key);
         let (sender, outcome) = std::sync::mpsc::channel::<LlmOutcome>();
@@ -1007,7 +1058,7 @@ impl App {
                 // never waits on the network. The failure keeps its
                 // message, which names the kind of failure it was.
                 let answer = endpoint
-                    .rewrite(rustel_pod_llm::STRUDEL_SYSTEM_PROMPT, &user)
+                    .rewrite(&system, &user)
                     .map_err(|error| error.to_string());
                 let _ = sender.send(answer);
             });
@@ -2279,6 +2330,14 @@ mod tests {
             panic!("the pod never finished");
         }
 
+        /// The system half of a request the mock server fielded: the block
+        /// a provider caches between calls.
+        fn system_half(sent: &serde_json::Value) -> &str {
+            sent["messages"][0]["content"]
+                .as_str()
+                .expect("the system half is text")
+        }
+
         /// The request the mock server fielded, parsed as JSON: the body
         /// the studio sent.
         fn sent_body(request: &str) -> serde_json::Value {
@@ -2427,10 +2486,19 @@ mod tests {
                 "the request went to the chat completions path: {request}"
             );
             let sent = sent_body(&request);
+            let system = system_half(&sent);
+            assert!(
+                system.starts_with(rustel_pod_llm::STRUDEL_SYSTEM_PROMPT),
+                "the system half is the instructions, then the reference"
+            );
+            assert!(
+                system.contains("- `lpf(frequency)`"),
+                "the default llm context carries the compact sheet"
+            );
             assert_eq!(
-                sent["messages"][0]["content"],
-                rustel_pod_llm::STRUDEL_SYSTEM_PROMPT,
-                "the system half is the core crate's constant"
+                system,
+                rustel_pod_llm::system_prompt(Some(rustel_pod_llm::ContextSize::Compact), &[]),
+                "and nothing else: no score, no prompt, no files"
             );
             let user = sent["messages"][1]["content"]
                 .as_str()
@@ -2442,6 +2510,16 @@ mod tests {
             assert!(
                 user.contains("make it funkier"),
                 "the typed prompt went out: {user}"
+            );
+            assert!(
+                user.starts_with("The current score:\n\n$: s(\"bd\")")
+                    && user.find("The change:").expect("the change is named")
+                        > user.find("The current score:").expect("the score is named"),
+                "the score comes first, then the change: {user}"
+            );
+            assert!(
+                !user.contains("Reference:") && !user.contains("lpf(frequency)"),
+                "no part of the documentation travels in the user turn: {user}"
             );
 
             // And it runs like an update: the studio-internal evaluation
@@ -2494,6 +2572,136 @@ mod tests {
             assert!(
                 lines.iter().any(|line| line.contains("rewrote first")),
                 "the log says what the pod did: {lines:?}"
+            );
+        }
+
+        /// The cache invariant, through the studio: two prompts with the
+        /// same settings put the same bytes in the system half, so the
+        /// prefix a provider cached for the first is the prefix of the
+        /// second.
+        #[test]
+        fn the_same_settings_send_the_same_system_bytes() {
+            let (first_base, first) = serve_once(openai_reply("$: s(\"bd\")\n"));
+            let (mut app, _directory) = llm_app();
+            llm_configured(&mut app, &first_base, "stored-key");
+            ask_and_finish(&mut app, "go");
+            let first_request = first.join().expect("the mock server thread ends");
+
+            let (second_base, second) = serve_once(openai_reply("$: s(\"bd\")\n"));
+            llm_configured(&mut app, &second_base, "stored-key");
+            ask_and_finish(&mut app, "go");
+            let second_request = second.join().expect("the mock server thread ends");
+
+            let first_sent = sent_body(&first_request);
+            let second_sent = sent_body(&second_request);
+            assert_eq!(
+                system_half(&first_sent),
+                system_half(&second_sent),
+                "nothing per-call reaches the system half"
+            );
+        }
+
+        /// The two sizes are two sheets: both open with the instructions,
+        /// and the full one carries the parameters the compact one leaves
+        /// out.
+        #[test]
+        fn the_context_row_chooses_which_sheet_the_request_carries() {
+            let (compact_base, compact) = serve_once(openai_reply("$: s(\"bd\")\n"));
+            let (mut app, _directory) = llm_app();
+            llm_configured(&mut app, &compact_base, "stored-key");
+            ask_and_finish(&mut app, "go");
+            let compact_sent = sent_body(&compact.join().expect("the mock server thread ends"));
+
+            app.ui_settings.llm_context = crate::settings::LlmContext::Full;
+            let (full_base, full) = serve_once(openai_reply("$: s(\"bd\")\n"));
+            llm_configured(&mut app, &full_base, "stored-key");
+            ask_and_finish(&mut app, "go");
+            let full_sent = sent_body(&full.join().expect("the mock server thread ends"));
+
+            let compact_system = system_half(&compact_sent);
+            let full_system = system_half(&full_sent);
+            for system in [compact_system, full_system] {
+                assert!(
+                    system.starts_with(rustel_pod_llm::STRUDEL_SYSTEM_PROMPT),
+                    "the instructions lead either size"
+                );
+            }
+            assert!(
+                full_system.len() > compact_system.len(),
+                "the full sheet is the longer one: {} against {}",
+                full_system.len(),
+                compact_system.len()
+            );
+            assert!(
+                compact_system.contains("- `lpf(frequency)`")
+                    && full_system.contains("- `lpf(frequency)`")
+            );
+            assert!(
+                full_system.contains("\n  - `frequency`: number")
+                    && !compact_system.contains("\n  - `frequency`"),
+                "the full sheet prints each parameter's type"
+            );
+        }
+
+        /// A file named by the llm context files row is appended after the
+        /// reference, verbatim, and its absence leaves every earlier byte
+        /// where it was.
+        #[test]
+        fn a_context_file_lands_after_the_sheet_and_changes_nothing_else() {
+            let (plain_base, plain) = serve_once(openai_reply("$: s(\"bd\")\n"));
+            let (mut app, directory) = llm_app();
+            llm_configured(&mut app, &plain_base, "stored-key");
+            ask_and_finish(&mut app, "go");
+            let without = system_half(&sent_body(
+                &plain.join().expect("the mock server thread ends"),
+            ))
+            .to_owned();
+
+            let document = "The house style: two lanes, then a break.";
+            std::fs::write(directory.path().join("house.md"), document).expect("the document");
+            app.ui_settings.llm_context_files = "house.md".into();
+            let (documented_base, documented) = serve_once(openai_reply("$: s(\"bd\")\n"));
+            llm_configured(&mut app, &documented_base, "stored-key");
+            ask_and_finish(&mut app, "go");
+            let with = system_half(&sent_body(
+                &documented.join().expect("the mock server thread ends"),
+            ))
+            .to_owned();
+
+            assert!(
+                with.starts_with(&without),
+                "the reference block is untouched by the document"
+            );
+            assert_eq!(
+                with[without.len()..].trim(),
+                document,
+                "the document follows the sheet, whole"
+            );
+        }
+
+        /// A document that does not read is said in the log and left out:
+        /// the rewrite is about the score, and a missing file must not stop
+        /// it.
+        #[test]
+        fn a_missing_context_file_is_said_in_the_log_and_the_rewrite_still_goes() {
+            let (base, server) = serve_once(openai_reply("$: s(\"bd sd\")\n"));
+            let (mut app, _directory) = llm_app();
+            llm_configured(&mut app, &base, "stored-key");
+            app.ui_settings.llm_context_files = "missing.md".into();
+            ask_and_finish(&mut app, "go");
+            let request = server.join().expect("the mock server thread ends");
+            assert_eq!(
+                system_half(&sent_body(&request)),
+                rustel_pod_llm::system_prompt(Some(rustel_pod_llm::ContextSize::Compact), &[]),
+                "the request went out without the file"
+            );
+            assert_eq!(app.editor().source(), "$: s(\"bd sd\")");
+            let lines = pod_lines(&app);
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.contains("missing.md") && line.contains("could not be read")),
+                "the log says which file was left out: {lines:?}"
             );
         }
 
@@ -2668,6 +2876,67 @@ mod tests {
             // An unreadable spelling reads as the default, not as an
             // error: the preferences file is hand-editable.
             assert_eq!(PodKind::parse("nonsense"), PodKind::Command);
+        }
+
+        /// The llm context row steps its ladder - off, compact, full - and
+        /// keeps the choice; the files row hands over to a prompt that keeps
+        /// the list it edits.
+        #[test]
+        fn the_context_rows_step_and_keep_their_values() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _) = plain_app(directory.path(), "$: s(\"bd\")\n");
+            assert_eq!(
+                app.ui_settings.llm_context,
+                crate::settings::LlmContext::Compact,
+                "compact is the default: the instructions and the one-line sheet"
+            );
+            app.toggle_settings_sheet();
+            let sheet = app.settings_sheet.as_mut().expect("the sheet");
+            sheet.selected = crate::settings::llm_context_row();
+            app.handle_settings_key(KeyCode::Right, false, false);
+            assert_eq!(
+                app.ui_settings.llm_context,
+                crate::settings::LlmContext::Full
+            );
+            assert_eq!(app.prefs.llm_context.as_deref(), Some("full"));
+            app.handle_settings_key(KeyCode::Right, false, false);
+            assert_eq!(
+                app.ui_settings.llm_context,
+                crate::settings::LlmContext::Off
+            );
+            assert_eq!(app.prefs.llm_context.as_deref(), Some("off"));
+            app.handle_settings_key(KeyCode::Right, false, false);
+            assert_eq!(
+                app.ui_settings.llm_context,
+                crate::settings::LlmContext::Compact
+            );
+            assert_eq!(app.prefs.llm_context.as_deref(), Some("compact"));
+            assert_eq!(
+                crate::settings::LlmContext::parse("nonsense"),
+                crate::settings::LlmContext::Compact,
+                "an unreadable spelling reads as the default"
+            );
+            assert_eq!(
+                crate::settings::LlmContext::Off.size(),
+                None,
+                "off leaves the reference out"
+            );
+
+            let sheet = app.settings_sheet.as_mut().expect("the sheet");
+            sheet.selected = crate::settings::llm_context_files_row();
+            app.handle_settings_key(KeyCode::Enter, false, false);
+            assert_eq!(
+                app.pod_prompt.as_ref().expect("the files prompt").kind,
+                PodPromptKind::ContextFiles
+            );
+            type_text(&mut app, "house.md:style.md");
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert_eq!(app.ui_settings.llm_context_files, "house.md:style.md");
+            assert_eq!(
+                app.prefs.llm_context_files.as_deref(),
+                Some("house.md:style.md"),
+                "the list reaches the preferences"
+            );
         }
     }
 

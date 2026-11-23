@@ -101,6 +101,14 @@ pub struct StudioPrefs {
     /// wins over it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub llm_api_key: Option<String>,
+    /// How much of the language reference the llm pod's system message
+    /// carries: `off`, `compact` or `full`. Absent is compact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm_context: Option<String>,
+    /// Files appended verbatim to that message: one path, or several
+    /// separated by colons. Absent or empty appends nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm_context_files: Option<String>,
     /// The command line the agent pod spawns. Absent is the default
     /// (`pi --mode rpc --no-session`); an empty string is the agent pod
     /// turned off.
@@ -857,6 +865,12 @@ impl StudioPrefs {
             llm_endpoint: self.llm_endpoint.clone().unwrap_or_default(),
             llm_model: self.llm_model.clone().unwrap_or_default(),
             llm_api_key: self.llm_api_key.clone().unwrap_or_default(),
+            llm_context: self
+                .llm_context
+                .as_deref()
+                .map(super::settings::LlmContext::parse)
+                .unwrap_or(defaults.llm_context),
+            llm_context_files: self.llm_context_files.clone().unwrap_or_default(),
             agent_command: self
                 .agent_command
                 .clone()
@@ -1072,6 +1086,8 @@ impl StudioPrefs {
         self.llm_endpoint = Some(settings.llm_endpoint.clone());
         self.llm_model = Some(settings.llm_model.clone());
         self.llm_api_key = Some(settings.llm_api_key.clone());
+        self.llm_context = Some(settings.llm_context.key().to_owned());
+        self.llm_context_files = Some(settings.llm_context_files.clone());
         self.agent_command = Some(settings.agent_command.clone());
         self.sync_name_from_title = Some(settings.sync_name_from_title);
         self.load_mode = Some(settings.load_mode.key().to_owned());
