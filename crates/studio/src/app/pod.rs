@@ -2691,6 +2691,55 @@ mod tests {
             );
         }
 
+        /// The row's list splits where the platform splits `PATH`, so a
+        /// document list behaves like every other path list: whitespace
+        /// around an entry is trimmed, an empty entry is skipped, and a
+        /// single path stays one path.
+        #[test]
+        fn the_context_file_list_splits_the_way_the_platform_splits_path() {
+            let joined = std::env::join_paths(["a.md", "style.md"]).expect("relative paths join");
+            let list = joined.to_str().expect("the joined list is text");
+            assert_eq!(
+                context_file_paths(list),
+                vec![PathBuf::from("a.md"), PathBuf::from("style.md")]
+            );
+            assert_eq!(
+                context_file_paths("  "),
+                Vec::<PathBuf>::new(),
+                "an unset row names nothing"
+            );
+            assert_eq!(
+                context_file_paths(" docs.md "),
+                vec![PathBuf::from("docs.md")],
+                "surrounding whitespace is trimmed"
+            );
+        }
+
+        /// A drive letter's colon belongs to the path: splitting the list by
+        /// hand cut `C:\sets\house.md` into a drive and a root-relative
+        /// fragment, so every prompt logged a document that could not be read
+        /// and a set on another drive resolved somewhere else.
+        #[cfg(windows)]
+        #[test]
+        fn a_context_file_keeps_its_drive_letter() {
+            assert_eq!(
+                context_file_paths(r"C:\sets\house.md"),
+                vec![PathBuf::from(r"C:\sets\house.md")],
+                "the drive colon is not a separator"
+            );
+        }
+
+        /// On unix the colon is the separator, so one row names two
+        /// documents.
+        #[cfg(not(windows))]
+        #[test]
+        fn a_colon_separates_two_context_files() {
+            assert_eq!(
+                context_file_paths("a.md:style.md"),
+                vec![PathBuf::from("a.md"), PathBuf::from("style.md")]
+            );
+        }
+
         /// A document that does not read is said in the log and left out:
         /// the rewrite is about the score, and a missing file must not stop
         /// it.
