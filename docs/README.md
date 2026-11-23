@@ -20,5 +20,6 @@ Use `rustel --help` for command options and `rustel doc NAME` for pattern help.
 For contributors: [build](building.md), [contribute](../CONTRIBUTING.md),
 [embed the engine](embedding.md), [maintain visuals](hydra-design.md),
 [maintain the reference](reference-migration.md),
+[measure the llm reference](llm-reference-evidence.md),
 [dependency patches](dependency-patches.md), and [release](releasing.md).
 See [Security](../SECURITY.md) for score and sample access rules.
