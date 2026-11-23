@@ -69,7 +69,7 @@
 use super::*;
 use ratatui::style::Style;
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use unicode_width::UnicodeWidthChar;
 
@@ -313,6 +313,19 @@ fn request_refusal(settings: &UiSettings) -> Option<String> {
 /// material, and a cached prefix must end before them.
 fn llm_user_message(score: &str, prompt: &str) -> String {
     format!("The current score:\n\n{score}\n\nThe change: {prompt}")
+}
+
+/// The paths the `llm context files` row names, split where the platform
+/// splits [`PATH`](std::env::split_paths): `:` on unix, `;` on Windows,
+/// where a drive letter's colon belongs to the path. Surrounding whitespace
+/// is trimmed and an empty entry is skipped, so an unset row names nothing.
+fn context_file_paths(list: &str) -> Vec<PathBuf> {
+    std::env::split_paths(list)
+        .filter_map(|path| {
+            let path = path.to_str()?.trim().to_owned();
+            (!path.is_empty()).then(|| PathBuf::from(path))
+        })
+        .collect()
 }
 
 /// The bounded tail of one pod's output.
@@ -681,7 +694,7 @@ impl App {
                     .into()
             }
             PodPromptKind::ContextFiles => {
-                "llm context files - one path or several separated by colons, from the set folder \u{b7} appending them invalidates the provider's cached prefix \u{b7} Enter keeps \u{b7} Esc closes"
+                "llm context files - one path or several separated the way PATH is, relative to the set folder \u{b7} they join the system message, so name only files you trust \u{b7} Enter keeps \u{b7} Esc closes"
                     .into()
             }
             PodPromptKind::AgentCommand => {
@@ -991,17 +1004,16 @@ impl App {
     fn llm_context_documents(&mut self, set: &Path) -> Vec<String> {
         let files = self.ui_settings.llm_context_files.clone();
         let mut documents = Vec::new();
-        for path in files
-            .split(':')
-            .map(str::trim)
-            .filter(|path| !path.is_empty())
-        {
-            match std::fs::read_to_string(set.join(path)) {
+        for path in context_file_paths(&files) {
+            match std::fs::read_to_string(set.join(&path)) {
                 Ok(text) => documents.push(text),
                 Err(error) => self.log.push(
                     LogLevel::Warn,
                     "pod",
-                    format!("llm context file {path} could not be read: {error}"),
+                    format!(
+                        "llm context file {} could not be read: {error}",
+                        path.display()
+                    ),
                 ),
             }
         }

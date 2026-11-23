@@ -47,12 +47,13 @@ wording.";
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ContextSize {
     /// One line per name: its signature, its aliases and its one-line
-    /// documentation. About 68 kB (17k tokens at four bytes a token) on the
-    /// complete product build.
+    /// documentation. About 69 kB - about 20k tokens, since this sheet runs
+    /// near 3.5 bytes a token - on the complete product build;
+    /// `docs/llm-reference-evidence.md` has the measurements.
     #[default]
     Compact,
     /// The same lines, then every parameter's type and description - where a
-    /// default is read. About 140 kB (35k tokens) on the same build.
+    /// default is read. About 141 kB, about 39k tokens, on the same build.
     Full,
 }
 

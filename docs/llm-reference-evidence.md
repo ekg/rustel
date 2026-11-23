@@ -11,10 +11,11 @@ The harness is `crates/pod-llm/tests/reference_ab.rs`. It sends the five
 prompts below once per condition through the pod's own `Endpoint` and the real
 `system_prompt`, and scores every reply mechanically: the runtime's lint (no
 syntax finding, so the reply parses as a score) and a name scan (every
-function-like name the reply calls exists in the sheet that request carried).
-The product's own `rustel check` - the lint plus a dry evaluation - is the
-second pass over the same files, and it is the one that decides the last two
-columns. A reader adds the judgement column: does the reply do what the
+function-like name the reply calls exists in the one-line reference - one
+yardstick for all three arms, including the arm that was sent no reference at
+all). The product's own `rustel check` - the lint plus a dry evaluation - is
+the second pass over the same files, and it is the one that decides the last
+two columns. A reader adds the judgement column: does the reply do what the
 request asked.
 
 ## The prompts
@@ -60,13 +61,22 @@ whole request (system plus the p1 user turn), read from the response's
 
 So the full reference costs 1.9 times the compact one, and compact costs 83
 times the instructions alone. The sheet is denser than four bytes a token -
-3.5 - because it is mostly names and punctuation, so the earlier stages'
-bytes/4 estimates (17k and 35k) were slightly high.
+3.5 - because it is mostly names and punctuation.
 
-Those are the sizes of the pod crate's own build. The complete product build's
-sheet adds the extension and Hydra tables (68,569 B compact, about 140,700 B
-full); no prompt below names an extension or a Hydra control, so the shape of
-the result holds for both.
+Those are the sizes of the pod crate's own build, where the runtime is linked
+without its `extensions` and `hydra` features. The complete product build's
+sheet adds those tables, and its message is the same 551-byte instruction
+block plus the same two-byte separators and size header:
+
+| Condition | Sheet | Assembled message | Tokens at the ratio above |
+| --- | --- | --- | --- |
+| `off` | - | 551 B | about 0.2k |
+| `compact` | 67,951 B | 68,616 B | about 20k |
+| `full` | 140,021 B | 140,703 B | about 39k |
+
+That is what the studio's `llm context` row and `docs/studio.md` quote. No
+prompt below names an extension or a Hydra control, so the shape of the result
+holds for both builds.
 
 The prefix does cache. One extra pair of identical calls with the compact
 message reported `cached_tokens` 0 on the first and 19,328 of 19,357 input

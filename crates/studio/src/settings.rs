@@ -696,10 +696,10 @@ pub enum LlmContext {
     /// shares no cached prefix with either sheet.
     Off,
     /// One line per installed name: its signature, its aliases and its
-    /// one-line documentation. About 17k tokens, the default.
+    /// one-line documentation. About 20k tokens, the default.
     #[default]
     Compact,
-    /// Every parameter's type and description as well. About 35k tokens.
+    /// Every parameter's type and description as well. About 39k tokens.
     Full,
 }
 
@@ -1951,8 +1951,9 @@ pub struct UiSettings {
     /// the build installs for about half the tokens the full one costs.
     pub llm_context: LlmContext,
     /// Files appended verbatim to that system message, when there are any:
-    /// one path, or several separated by colons. A relative path is taken
-    /// from the set folder, the folder the pods run in. Empty by default.
+    /// one path, or several separated the way the platform separates `PATH`
+    /// entries. A relative path is taken from the set folder, the folder the
+    /// pods run in. Empty by default.
     pub llm_context_files: String,
     /// The command line the agent pod spawns when the pod kind is
     /// `agent`: a program speaking the RPC protocol (JSONL commands on
@@ -2995,7 +2996,7 @@ impl Row {
                 "the language reference the model is told \u{b7} off sends the instructions alone"
             }
             Self::LlmContextFiles => {
-                "files appended to that reference \u{b7} editing them invalidates the cached prefix \u{b7} Enter edits it"
+                "files that join the system message, so name only files you trust \u{b7} editing them invalidates the cached prefix \u{b7} Enter edits it"
             }
             Self::AgentCommand => {
                 "the RPC agent the prompt talks to \u{b7} one process, alive across prompts \u{b7} Enter edits it"

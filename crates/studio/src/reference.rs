@@ -871,6 +871,57 @@ pub fn engine_knows() -> impl Fn(&str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    mod language_sheet {
+        use super::super::*;
+        use std::collections::HashSet;
+
+        /// The llm pod is told the names this engine installs, read from
+        /// `rustel_runtime::reference::cheat_sheet`; the panel assembles its
+        /// own list from the same tables. The panel's list is a second call
+        /// list, so a table added to one and not the other would leave names
+        /// out of the sheet without a word: every name the panel carries and
+        /// the engine installs has a line in the sheet.
+        #[test]
+        fn every_installed_name_the_panel_carries_has_a_line_in_the_sheet() {
+            let known = engine_knows();
+            let sheet = rustel_runtime::reference::cheat_sheet(
+                rustel_runtime::reference::SheetDetail::Line,
+            );
+            let mut listed: HashSet<&str> = HashSet::new();
+            let mut sections = false;
+            for line in sheet.lines() {
+                if let Some(rest) = line.strip_prefix("- `") {
+                    let signature = rest.split('`').next().unwrap_or(rest);
+                    listed.insert(signature.split('(').next().unwrap_or(signature));
+                } else if line.starts_with("## ") {
+                    sections = true;
+                } else if sections {
+                    // A catalogue section is a wrapped, comma-separated list
+                    // of words a score writes inside a call.
+                    listed.extend(
+                        line.split(',')
+                            .map(str::trim)
+                            .filter(|word| !word.is_empty()),
+                    );
+                }
+            }
+            let reference = Reference::load(&known);
+            let mut missing = Vec::new();
+            for index in 0..reference.len() {
+                let Some(entry) = reference.entry(index) else {
+                    continue;
+                };
+                if known(&entry.name) && !listed.contains(entry.name.as_str()) {
+                    missing.push(entry.name.clone());
+                }
+            }
+            assert!(
+                missing.is_empty(),
+                "the sheet leaves out names the panel carries: {missing:?}"
+            );
+        }
+    }
+
     mod catalogue {
         use super::super::*;
 

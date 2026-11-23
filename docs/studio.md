@@ -475,10 +475,11 @@ complete rewritten score. Five rows configure it, beside the kind row:
 - **llm context** - how much of the language reference the model is told:
   `off` sends the instructions alone, `compact` (the default) sends one line
   per name the build installs, and `full` adds every parameter's type and
-  description. About 17k tokens for `compact` and 35k for `full` on a
+  description. About 20k tokens for `compact` and 39k for `full` on a
   complete build. Left and right step it.
 - **llm context files** - files appended verbatim after that reference: one
-  path, or several separated by colons. A relative path is taken from the set
+  path, or several separated the way the platform separates `PATH` entries
+  (`:` on unix, `;` on Windows). A relative path is taken from the set
   folder, so a set can carry its own documentation. Enter edits the list.
 
 The key can also come from the `RUSTEL_LLM_KEY` environment variable, which
@@ -494,7 +495,13 @@ under its heading, with the signature, the aliases and a one-line
 description. The sheet is generated from the same tables the reference panel
 reads, so it cannot drift from the engine a score will run on, and a model
 told about `lpf` or `_pianoroll` has no reason to invent a name that does not
-exist.
+exist. A studio test compares the two lists, so a table added to one of them
+and not the other fails the suite.
+
+[Does the language reference change what the model writes?](llm-reference-evidence.md)
+measures what each size costs and what it changed in one set of prompts:
+the reference does not make a reply a score, but it supplies the catalogue
+spellings and the parameter meanings a model would otherwise guess at.
 
 The block is the same bytes on every call. Nothing in it comes from the
 score, the prompt, the clock or the host, which is what lets a provider's
@@ -505,6 +512,13 @@ context** row, editing a file that **llm context files** names, or upgrading
 Rustel changes the prefix, and the first call after that pays for the whole
 message again. A document that `llm context files` names but cannot read is
 left out and said in the Log under `pod`; the rewrite still goes.
+
+A document that does read is appended after the reference as part of the same
+system message, so its text carries the instructions' authority: a file that
+countermands them is followed rather than questioned, and the reply that
+comes back replaces the score and is evaluated. Name only files you trust.
+Each file is read whole, with no size limit, and a large one costs its tokens
+on every call that does not hit the cache.
 
 Submitting a prompt sends the rewrite on a background thread - that system
 message, the active tab's current score, and your prompt - and the call

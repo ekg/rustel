@@ -106,7 +106,8 @@ pub struct StudioPrefs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub llm_context: Option<String>,
     /// Files appended verbatim to that message: one path, or several
-    /// separated by colons. Absent or empty appends nothing.
+    /// separated the way the platform separates `PATH` entries. Absent or
+    /// empty appends nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub llm_context_files: Option<String>,
     /// The command line the agent pod spawns. Absent is the default
