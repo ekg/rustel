@@ -133,6 +133,27 @@ reports. Use their `--help` for options. `trace` gives no sound without
 `--device-audio`. Use `rustel play song.strudel` to hear a score. Hydra
 pictures are visible in Studio; CLI playback and query do not render them.
 
+## Reference for a language model
+
+```sh
+rustel reference --llm > reference.md
+rustel reference --llm-full > reference-full.md
+```
+
+`reference` prints the language reference as a Markdown cheat sheet: what
+Rustel is and how a score is written, the engine version the sheet describes,
+then one line for every name the engine installs - grouped as the reference
+panel groups them, each with its signature and its one-line documentation -
+and finally the chord, scale and sound catalogues as word lists.
+
+The sheet is built from the tables that install each name, so it describes
+exactly the build that printed it. No name appears that this engine does not
+install, nothing is copied by hand, and the same build prints the same bytes:
+there are no timestamps, paths, or machine-specific text, which makes the
+sheet safe to cache and to commit beside a prompt. `--llm-full` adds every
+entry's parameters with their types and descriptions and is about twice the
+size; the default sheet is the one to hand a model with a prompt budget.
+
 ## Sessions
 
 Watch mode records score changes in `~/.rustel/sessions/` by default.

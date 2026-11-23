@@ -1064,6 +1064,64 @@ fn samples_help_documents_the_group() {
     }
 }
 
+/// Run a command whose stdout is larger than a pipe buffer - a cheat sheet
+/// is - and return the text. [`wait_within`] reads the pipes only after the
+/// child exits, so a full pipe would stop the child mid-write; a reader
+/// thread drains stdout while the child runs instead.
+fn ok_stdout_large(args: &[&str]) -> String {
+    use std::io::Read as _;
+
+    let mut child = rustel()
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn rustel");
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        stdout.read_to_string(&mut text).expect("read the output");
+        text
+    });
+    let out = wait_within(child, args, RUN_LIMIT);
+    assert!(
+        out.status.success(),
+        "{args:?} failed with {:?}\nstderr: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    reader.join().expect("the reader finishes")
+}
+
+#[test]
+fn reference_prints_one_cheat_sheet_per_build() {
+    let line = ok_stdout_large(&["reference", "--llm"]);
+    assert!(
+        line.starts_with("# Rustel language reference\n"),
+        "{line:.200}"
+    );
+    assert!(
+        line.contains(rustel_runtime::product::VERSION),
+        "the sheet names the version of the build that printed it"
+    );
+    assert!(line.contains("- `lpf(frequency)`"), "{line:.2000}");
+    // A prompt cache and a committed transcript both need the same bytes
+    // from one build, so nothing in the sheet may depend on the run.
+    assert_eq!(line, ok_stdout_large(&["reference", "--llm"]));
+
+    let full = ok_stdout_large(&["reference", "--llm-full"]);
+    assert!(full.len() > line.len(), "the full sheet adds parameters");
+    assert!(
+        full.contains("  - `frequency`: number | Pattern"),
+        "{full:.2000}"
+    );
+}
+
+#[test]
+fn reference_without_a_sheet_to_print_says_which_ones_there_are() {
+    assert_reported_failure(&["reference"], "--llm");
+}
+
 #[test]
 fn query_emits_parseable_json_for_the_documented_shape() {
     let out = ok_stdout(&["query", "--json", "-e", r#"s("bd sd")"#]);

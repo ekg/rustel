@@ -57,6 +57,9 @@ mod process_stats;
 mod producer;
 /// Product names shared by configuration, diagnostics, and CLI help.
 pub mod product;
+/// The language reference as data: the documented names this build installs,
+/// assembled without a UI, and the Markdown cheat sheet built from them.
+pub mod reference;
 mod render;
 pub mod sample_fetch;
 pub mod sample_server;

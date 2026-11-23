@@ -1003,6 +1003,24 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Print the whole language reference as a Markdown cheat sheet.
+    ///
+    ///     rustel reference --llm > reference.md
+    ///
+    /// The sheet is built from the tables that install every name, so it
+    /// describes this build and nothing else: no table is copied by hand, no
+    /// name is listed that the engine does not install, and the same build
+    /// prints the same bytes. It is what to give a language model that writes
+    /// scores.
+    Reference {
+        /// One line for every name: its signature and its one-line
+        /// documentation.
+        #[arg(long, conflicts_with = "llm_full")]
+        llm: bool,
+        /// The same lines, with each entry's parameters and their types.
+        #[arg(long)]
+        llm_full: bool,
+    },
     #[command(long_about = product::WATCH_CODE_LONG_ABOUT)]
     WatchCode,
     /// List MIDI ports - outputs, then inputs - each in the order a numeric
@@ -2290,6 +2308,7 @@ fn run_command(
         Command::Doctor { json } => run_doctor(json, dispatch),
         #[cfg(feature = "studio")]
         Command::Doc { name, json } => run_doc(&name, json),
+        Command::Reference { llm, llm_full } => run_reference(llm, llm_full),
         Command::MidiList { json } => run_midi_list(json),
         Command::Completions { shell, install } => {
             let shell = match shell.or_else(shell_from_environment) {
@@ -3023,6 +3042,25 @@ fn run_doc(name: &str, json: bool) -> Result<(), RuntimeError> {
     for line in entry_body(&entry, 100) {
         outln!("{}", line.text);
     }
+    Ok(())
+}
+
+/// Print the language reference as a Markdown cheat sheet: the same tables
+/// the studio's reference panel shows, for a language model rather than a
+/// reader at the keyboard.
+fn run_reference(llm: bool, llm_full: bool) -> Result<(), RuntimeError> {
+    use rustel_runtime::reference::{SheetDetail, cheat_sheet};
+    let detail = match (llm, llm_full) {
+        (true, _) => SheetDetail::Line,
+        (false, true) => SheetDetail::Params,
+        (false, false) => {
+            return Err(RuntimeError::Message(
+                "say which sheet: --llm for one line per name, --llm-full with each entry's parameters"
+                    .into(),
+            ));
+        }
+    };
+    out!("{}", cheat_sheet(detail));
     Ok(())
 }
 
